@@ -52,8 +52,12 @@ library KitchenCurveMaths {
         uint256 tokenIn
     ) internal pure returns (uint256 ethOut) {
     // Reverse of getTokensForEth: used for quoting sellbacks
-        require(tokenIn > 0, "Zero tokens");
-        require(tokensSold + tokenIn <= totalSupply, "Over-sell");
+    // trivial cases
+    if (tokenIn == 0 || tokensSold == 0) return 0;
+
+    // Correct invariant for sells:
+    // You can’t sell more than what’s currently in circulation.
+    require(tokenIn <= tokensSold, "Over-sell");
 
     uint256 tokenReserve = totalSupply - tokensSold;
     uint256 ethReserve   = ethRaised + VIRTUAL_ETH;

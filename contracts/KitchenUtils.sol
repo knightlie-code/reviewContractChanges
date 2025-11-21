@@ -3,12 +3,21 @@ pragma solidity ^0.8.20;
 
 import "./KitchenStorage.sol";
 import "./KitchenCurveMaths.sol";
+import "./KitchenTimelock.sol";
 
-contract KitchenUtils {
+interface IKitchenOracles {
+    function ethUsd() external view returns (uint256 price, uint256 updatedAt);
+}
+
+
+contract KitchenUtils is KitchenTimelock {
     KitchenStorage public storageContract;
     address public owner;
+    address public oracle;
+
 
     event StorageUpdated(address indexed oldStorage, address indexed newStorage);
+    event OracleUpdated(address indexed oldOracle, address indexed newOracle);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
@@ -20,22 +29,72 @@ contract KitchenUtils {
         storageContract = KitchenStorage(_storageAddress);
     }
 
-    function updateStorage(address _newStorage) external onlyOwner {
+    function updateStorage(address _newStorage) external onlyOwner timelocked(keccak256("UPDATE_STORAGE")) {
         address old = address(storageContract);
         storageContract = KitchenStorage(_newStorage);
         emit StorageUpdated(old, _newStorage);
     }
 
+function setOracle(address _oracle)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_ORACLE"))
+{
+    require(_oracle != address(0), "Invalid oracle");
+    emit OracleUpdated(oracle, _oracle);
+    oracle = _oracle;
+}
+
+
     // ========= TRADE FEES (BPS) =========
     // ZeroSimple + SuperSimple => 1.0% (100 bps)
     // Basic                    => 1.0% (100 bps)
     // Advanced                 => 1.0% (100 bps)
+    // ========= CONFIGURABLE TRADE FEES (BPS per type) =========
+    uint256 public tradeFeeAdvanced = 100;   // 1.0%
+    uint256 public tradeFeeBasic    = 100;   // 1.0%
+    uint256 public tradeFeeSimple   = 100;   // 1.0%
+
+        // ========= DYNAMIC TRADE FEE RESOLUTION =========
     function getTradeFee(address token) public view returns (uint256) {
         KitchenStorage.CurveProfile p = storageContract.tokenCurveProfile(token);
-        if (p == KitchenStorage.CurveProfile.ADVANCED) return 100;
-        if (p == KitchenStorage.CurveProfile.BASIC) return 100;
-        return 100; // SUPER_SIMPLE or ZERO_SIMPLE
+        if (p == KitchenStorage.CurveProfile.ADVANCED) return tradeFeeAdvanced;
+        if (p == KitchenStorage.CurveProfile.BASIC) return tradeFeeBasic;
+        return tradeFeeSimple; // SUPER_SIMPLE or ZERO_SIMPLE
     }
+
+    event TradeFeeUpdated(string tokenType, uint256 oldValue, uint256 newValue);
+
+    function updateTradeFeeAdvanced(uint256 newFee)
+        external
+        onlyOwner
+        timelocked(keccak256("UPDATE_TRADE_FEE_ADVANCED"))
+    {
+        require(newFee <= 100, "Too high"); // ≤1%
+        emit TradeFeeUpdated("ADVANCED", tradeFeeAdvanced, newFee);
+        tradeFeeAdvanced = newFee;
+    }
+
+    function updateTradeFeeBasic(uint256 newFee)
+        external
+        onlyOwner
+        timelocked(keccak256("UPDATE_TRADE_FEE_BASIC"))
+    {
+        require(newFee <= 100, "Too high");
+        emit TradeFeeUpdated("BASIC", tradeFeeBasic, newFee);
+        tradeFeeBasic = newFee;
+    }
+
+    function updateTradeFeeSimple(uint256 newFee)
+        external
+        onlyOwner
+        timelocked(keccak256("UPDATE_TRADE_FEE_SIMPLE"))
+    {
+        require(newFee <= 100, "Too high");
+        emit TradeFeeUpdated("SIMPLE", tradeFeeSimple, newFee);
+        tradeFeeSimple = newFee;
+    }
+
 
     // ========= CURVE TAX (PERCENT) =========
     // Advanced: decays but never below finalTaxRate
@@ -44,28 +103,54 @@ contract KitchenUtils {
     function getCurrentTax(address token) public view returns (uint256) {
         KitchenStorage.CurveProfile p = storageContract.tokenCurveProfile(token);
 
-        if (p == KitchenStorage.CurveProfile.ADVANCED) {
-            KitchenStorage.TokenAdvanced memory a = storageContract.getTokenAdvanced(token);
-            KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
+if (p == KitchenStorage.CurveProfile.ADVANCED) {
+    KitchenStorage.TokenAdvanced memory a = storageContract.getTokenAdvanced(token);
+    KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
 
-            if (a.taxDropInterval == 0) return a.curveStartingTax;
+    // Clamp the final floor:
+    // - never above 5
+    // - force to 0 if graduating to NO_TAX
+    uint256 ft = a.finalTaxRate;
+    if (ft > 5) ft = 5;
+    // NOTE: Do NOT force ft = 0 for NO_TAX tokens; they can still decay naturally to 0 during curve.
+    // The graduation step will carry their finalTaxRate (0) to the real ERC20.
 
-            uint256 steps = (block.timestamp - s.createdAtTimestamp) / a.taxDropInterval;
-            uint256 decay = steps * a.taxDropStep;
+    if (a.taxDropInterval == 0) {
+        // static starting tax but not below clamped floor
+        return a.curveStartingTax < ft ? ft : a.curveStartingTax;
+    }
 
-            if (decay >= a.curveStartingTax) return a.finalTaxRate;
-            uint256 current = a.curveStartingTax - decay;
-            return current < a.finalTaxRate ? a.finalTaxRate : current;
-        }
+    uint256 elapsed = block.timestamp - s.limitsStart;
+    uint256 decay = (elapsed * a.taxDropStep) / a.taxDropInterval;
+
+
+    if (decay >= a.curveStartingTax) return ft;
+    uint256 current = a.curveStartingTax - decay;
+    return current < ft ? ft : current;
+}
+
 
     // BASIC profile: static startingTax that flips to finalTax after `curveTaxDuration` seconds
-    if (p == KitchenStorage.CurveProfile.BASIC) {
-        KitchenStorage.TokenBasic memory b = storageContract.getTokenBasic(token);
-        KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-        if (b.curveTaxDuration == 0) return b.curveStartingTax;
-        bool finished = block.timestamp >= s.createdAtTimestamp + b.curveTaxDuration;
-        return finished ? b.finalTaxRate : b.curveStartingTax;
-        }
+// BASIC profile: static startingTax that flips to finalTax after `curveTaxDuration` seconds
+if (p == KitchenStorage.CurveProfile.BASIC) {
+    KitchenStorage.TokenBasic memory b = storageContract.getTokenBasic(token);
+    KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
+
+    // Clamp the final floor:
+    // - never above 5
+    // - force to 0 if graduating to NO_TAX
+    uint256 ft = b.finalTaxRate;
+    if (ft > 5) ft = 5;
+
+    if (b.curveTaxDuration == 0) {
+        // static starting tax but not below clamped floor
+        return b.curveStartingTax < ft ? ft : b.curveStartingTax;
+    }
+
+    bool finished = block.timestamp >= s.limitsStart + b.curveTaxDuration;
+    return finished ? ft : (b.curveStartingTax < ft ? ft : b.curveStartingTax);
+}
+
 
         return 0; // SUPER_SIMPLE or ZERO_SIMPLE
     }
@@ -77,7 +162,7 @@ contract KitchenUtils {
         if (p == KitchenStorage.CurveProfile.ADVANCED) {
             KitchenStorage.TokenAdvanced memory a = storageContract.getTokenAdvanced(token);
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-            return block.timestamp >= s.createdAtTimestamp + a.limitRemovalTime;
+            return block.timestamp >= s.limitsStart + a.limitRemovalTime;
         }
 
         // BASIC: each limit (max wallet, max tx) has its own duration; both must have expired
@@ -85,8 +170,8 @@ contract KitchenUtils {
         if (p == KitchenStorage.CurveProfile.BASIC) {
             KitchenStorage.TokenBasic memory b = storageContract.getTokenBasic(token);
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-            bool walletLift = (b.curveMaxWalletDuration > 0) && (block.timestamp >= s.createdAtTimestamp + b.curveMaxWalletDuration);
-            bool txLift     = (b.curveMaxTxDuration > 0)     && (block.timestamp >= s.createdAtTimestamp + b.curveMaxTxDuration);
+            bool walletLift = (b.curveMaxWalletDuration > 0) && (block.timestamp >= s.limitsStart + b.curveMaxWalletDuration);
+            bool txLift     = (b.curveMaxTxDuration > 0)     && (block.timestamp >= s.limitsStart + b.curveMaxTxDuration);
             return walletLift && txLift;
         }
 
@@ -105,8 +190,10 @@ contract KitchenUtils {
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
             if (isLimitsLifted(token)) return type(uint256).max;
             if (a.maxWalletInterval == 0) return a.maxWalletStart;
-            uint256 steps = (block.timestamp - s.createdAtTimestamp) / a.maxWalletInterval;
-            return a.maxWalletStart + (steps * a.maxWalletStep);
+            uint256 elapsed = block.timestamp - s.limitsStart;
+            uint256 increment = (elapsed * a.maxWalletStep) / a.maxWalletInterval;
+            return a.maxWalletStart + increment;
+
         }
 
         // BASIC: before the wallet duration expires the configured maxWallet applies,
@@ -114,7 +201,7 @@ contract KitchenUtils {
         if (p == KitchenStorage.CurveProfile.BASIC) {
             KitchenStorage.TokenBasic memory b = storageContract.getTokenBasic(token);
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-            if (b.curveMaxWalletDuration > 0 && block.timestamp >= s.createdAtTimestamp + b.curveMaxWalletDuration)
+            if (b.curveMaxWalletDuration > 0 && block.timestamp >= s.limitsStart + b.curveMaxWalletDuration)
                 return type(uint256).max;
             return b.curveMaxWallet;
         }
@@ -134,15 +221,17 @@ contract KitchenUtils {
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
             if (isLimitsLifted(token)) return type(uint256).max;
             if (a.maxTxInterval == 0) return a.maxTxStart;
-            uint256 steps = (block.timestamp - s.createdAtTimestamp) / a.maxTxInterval;
-            return a.maxTxStart + (steps * a.maxTxStep);
+            uint256 elapsed = block.timestamp - s.limitsStart;
+            uint256 increment = (elapsed * a.maxTxStep) / a.maxTxInterval;
+            return a.maxTxStart + increment;
+
         }
 
         // BASIC: maxTx similar to maxWallet in lifetime semantics.
         if (p == KitchenStorage.CurveProfile.BASIC) {
             KitchenStorage.TokenBasic memory b = storageContract.getTokenBasic(token);
             KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-            if (b.curveMaxTxDuration > 0 && block.timestamp >= s.createdAtTimestamp + b.curveMaxTxDuration)
+            if (b.curveMaxTxDuration > 0 && block.timestamp >= s.limitsStart + b.curveMaxTxDuration)
                 return type(uint256).max;
             return b.curveMaxTx;
         }
@@ -189,18 +278,34 @@ function getVirtualPrice(address token) public view returns (uint256) {
         return KitchenCurveMaths.ethAtSupplyFromGenesis(ts, supply);
     }
 
-    /// Quick access to global bounds
-    function getGraduationBounds() external view returns (uint256 minEthAtCap, uint256 maxEthAtCap, uint256 overshootBps) {
-        minEthAtCap = storageContract.minEthAtCap();
-        maxEthAtCap = storageContract.maxEthAtCap();
-        overshootBps = storageContract.overshootBps();
-    }
+function quoteDevBuyOptions(address token)
+    external
+    view
+    returns (uint256[5] memory ethCosts)
+{
+    // percentages we want: 1, 3, 5, 10, 15
+    uint256[5] memory percents = [uint256(1), 3, 5, 10, 15];
 
-    /// Check current pool is within configured bounds
-    function isPoolWithinGraduationBounds(address token) external view returns (bool) {
-        KitchenStorage.TokenState memory s = storageContract.getTokenState(token);
-        return s.ethPool >= storageContract.minEthAtCap() && s.ethPool <= storageContract.maxEthAtCap();
+    KitchenStorage.CurveProfile p = storageContract.tokenCurveProfile(token);
+    uint256 totalSupply;
+
+    if (p == KitchenStorage.CurveProfile.ADVANCED)
+        totalSupply = storageContract.getTokenAdvanced(token).totalSupply;
+    else if (p == KitchenStorage.CurveProfile.BASIC)
+        totalSupply = storageContract.getTokenBasic(token).totalSupply;
+    else if (p == KitchenStorage.CurveProfile.SUPER_SIMPLE)
+        totalSupply = storageContract.getTokenSuperSimple(token).totalSupply;
+    else
+        totalSupply = storageContract.getTokenZeroSimple(token).totalSupply;
+
+    for (uint256 i = 0; i < percents.length; i++) {
+        uint256 supplyPoint = (totalSupply * percents[i]) / 100;
+        ethCosts[i] = KitchenCurveMaths.ethAtSupplyFromGenesis(totalSupply, supplyPoint);
     }
+    return ethCosts;
+}
+
+
 
     // ========= QUOTES (fee-inclusive) =========
     function quoteBuy(address token, uint256 ethIn)
@@ -256,4 +361,15 @@ function getVirtualPrice(address token) public view returns (uint256) {
         if (p == KitchenStorage.CurveProfile.SUPER_SIMPLE) return storageContract.getTokenSuperSimple(token).totalSupply;
         return storageContract.getTokenZeroSimple(token).totalSupply;
     }
+
+function _readEthUsdPrice(address oracleAddr) internal view returns (uint256 price, uint256 updatedAt) {
+    if (oracleAddr == address(0)) return (0, 0);
+    (bool ok, bytes memory data) = oracleAddr.staticcall(
+        abi.encodeWithSignature("ethUsd()")
+    );
+    if (ok && data.length >= 64) {
+        (price, updatedAt) = abi.decode(data, (uint256, uint256));
+    }
+}
+
 }

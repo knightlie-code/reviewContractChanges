@@ -28,6 +28,9 @@ interface IKitchenFactory {
         uint256 startTime;
         uint256 finalTaxRate;
         bool removeHeader;
+        // --- NEW MULTI-TAX WALLET SUPPORT ---
+        address[4] taxWallets;  // Up to 4 wallets
+        uint8[4]   taxSplits;   // Percentages (sum = 100)
     }
 
     struct StaticCurveParams {

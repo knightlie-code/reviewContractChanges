@@ -3,11 +3,15 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./KitchenTimelock.sol";
+
 
 /// @title SteakLockers
 /// @notice LP Locker used by the Steakhouse token deployment system
 /// Locks LP tokens during V2 launch and allows creators to extend, transfer, or withdraw after lock expiry
-contract SteakLockers is ReentrancyGuard {
+contract SteakLockers is ReentrancyGuard, KitchenTimelock {
+    using SafeERC20 for IERC20;
     struct Lock {
         uint256 amount;
         uint256 unlockTime;
@@ -31,6 +35,46 @@ contract SteakLockers is ReentrancyGuard {
         uint256 unlockTime;
         address owner;
     }
+
+// --- VESTING LOCK SUPPORT ---
+
+struct ERC20VestingLock {
+    uint256 amount;              // total amount locked
+    uint256 startTime;           // when vesting starts (after optional cliff)
+    uint256 initialUnlockDate;   // first unlock date (can be = startTime)
+    uint256 releaseInterval;     // seconds between each partial unlock
+    uint256 releasePercent;      // % released each interval (e.g. 10)
+    uint256 amountWithdrawn;     // total amount already claimed
+    address owner;
+    bool active;
+}
+
+// token => incremental vestingLockId counter
+mapping(address => uint256) public vestingLockCount;
+// token => lockId => lock data
+mapping(address => mapping(uint256 => ERC20VestingLock)) public vestingLocks;
+// token => list of vestingLockIds for UI
+mapping(address => uint256[]) public vestingLockIdsByToken;
+
+// events
+event ERC20VestingLocked(
+    address indexed token,
+    uint256 indexed lockId,
+    address indexed owner,
+    uint256 amount,
+    uint256 startTime,
+    uint256 initialUnlockDate,
+    uint256 releaseInterval,
+    uint256 releasePercent
+);
+event ERC20VestingClaimed(
+    address indexed token,
+    uint256 indexed lockId,
+    address indexed owner,
+    uint256 amount
+);
+event ERC20VestingCancelled(address indexed token, uint256 indexed lockId);
+
 
     // token => incremental lockId counter
     mapping(address => uint256) public erc20LockCount;
@@ -64,6 +108,10 @@ contract SteakLockers is ReentrancyGuard {
     event MinLpLockTimeUpdated(uint256 newTime);
     event EmergencyWithdraw(address indexed token, address indexed to, uint256 amount);
 
+    // --- Governance Events ---
+    event AuthorizedCallerUpdated(address indexed oldCaller, address indexed newCaller);
+
+
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
         _;
@@ -93,7 +141,7 @@ contract SteakLockers is ReentrancyGuard {
         require(duration >= minLpLockTime, "Below min lock time"); 
         require(amount > 0, "Zero LP amount");
 
-        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "LP transfer failed");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
         lpLocks[token] = Lock({
             amount: amount,
@@ -103,7 +151,7 @@ contract SteakLockers is ReentrancyGuard {
 
         lockedTokens.push(token);
 
-        payable(steakhouseTreasury).transfer(msg.value);
+        (bool ok, ) = payable(steakhouseTreasury).call{value: msg.value}(""); require(ok, "Fee xfer failed");
         emit Locked(token, creator, amount, block.timestamp + duration);
     }
 
@@ -119,7 +167,7 @@ contract SteakLockers is ReentrancyGuard {
         require(token != address(0), "Zero token");
 
         // pull tokens
-        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Token transfer failed");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
         // create new lockId
         uint256 lockId = ++erc20LockCount[token];
@@ -133,10 +181,56 @@ contract SteakLockers is ReentrancyGuard {
         erc20LockIdsByToken[token].push(lockId);
 
         // forward fee to treasury
-        payable(steakhouseTreasury).transfer(msg.value);
+        (bool ok, ) = payable(steakhouseTreasury).call{value: msg.value}(""); require(ok, "Fee xfer failed");
 
         emit ERC20Locked(token, lockId, msg.sender, amount, unlock);
     }
+
+// --- create vesting-style ERC-20 lock ---
+function lockERC20Vesting(
+    address token,
+    uint256 amount,
+    uint256 startTime,
+    uint256 initialUnlockDate,
+    uint256 releaseInterval,
+    uint256 releasePercent
+) external payable nonReentrant {
+    require(msg.value == erc20LockFee, "Fee mismatch");
+    require(amount > 0, "Zero amount");
+    require(releasePercent > 0 && releasePercent <= 100, "Bad percent");
+    require(releaseInterval >= 1 days, "Too frequent");
+    require(initialUnlockDate >= startTime, "Unlock < start");
+
+    IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+    uint256 lockId = ++vestingLockCount[token];
+    vestingLocks[token][lockId] = ERC20VestingLock({
+        amount: amount,
+        startTime: startTime,
+        initialUnlockDate: initialUnlockDate,
+        releaseInterval: releaseInterval,
+        releasePercent: releasePercent,
+        amountWithdrawn: 0,
+        owner: msg.sender,
+        active: true
+    });
+    vestingLockIdsByToken[token].push(lockId);
+
+    (bool ok, ) = payable(steakhouseTreasury).call{value: msg.value}("");
+    require(ok, "Fee xfer failed");
+
+    emit ERC20VestingLocked(
+        token,
+        lockId,
+        msg.sender,
+        amount,
+        startTime,
+        initialUnlockDate,
+        releaseInterval,
+        releasePercent
+    );
+}
+
 
     /// @notice Extend an ERC-20 lock you own
     function erc20ExtendLock(address token, uint256 lockId, uint256 extraTime) external {
@@ -168,7 +262,7 @@ contract SteakLockers is ReentrancyGuard {
         // zero-out before external call
         L.amount = 0;
 
-        require(IERC20(token).transfer(msg.sender, amt), "Transfer failed");
+        IERC20(token).safeTransfer(msg.sender, amt);
         emit ERC20Unlocked(token, lockId, msg.sender, amt);
     }
 
@@ -208,9 +302,49 @@ function withdraw(address token) external nonReentrant {
     // Update stored lock (permanent 25% locked forever)
     l.amount = remainder;
 
-    require(IERC20(token).transfer(msg.sender, withdrawable), "Transfer failed");
+    IERC20(token).safeTransfer(msg.sender, withdrawable);
 
     emit Unlocked(token, msg.sender, withdrawable);
+}
+
+// ---  compute vested amount available to claim ---
+function getReleasableAmount(address token, uint256 lockId)
+    public
+    view
+    returns (uint256)
+{
+    ERC20VestingLock memory v = vestingLocks[token][lockId];
+    if (!v.active || block.timestamp < v.initialUnlockDate) return 0;
+
+    uint256 elapsed = block.timestamp - v.initialUnlockDate;
+    uint256 periods = elapsed / v.releaseInterval;
+    uint256 totalPercent = periods * v.releasePercent;
+    if (totalPercent > 100) totalPercent = 100;
+
+    uint256 unlocked = (v.amount * totalPercent) / 100;
+    if (unlocked <= v.amountWithdrawn) return 0;
+    return unlocked - v.amountWithdrawn;
+}
+
+
+// ---  claim vested portion ---
+function claimVested(address token, uint256 lockId) external nonReentrant {
+    ERC20VestingLock storage v = vestingLocks[token][lockId];
+    require(v.owner == msg.sender, "Not owner");
+    require(v.active, "Inactive");
+
+    uint256 claimable = getReleasableAmount(token, lockId);
+    require(claimable > 0, "Nothing to claim");
+
+    v.amountWithdrawn += claimable;
+    IERC20(token).safeTransfer(msg.sender, claimable);
+    emit ERC20VestingClaimed(token, lockId, msg.sender, claimable);
+
+    // auto-deactivate when fully vested
+    if (v.amountWithdrawn >= v.amount) {
+        v.active = false;
+        emit ERC20VestingCancelled(token, lockId);
+    }
 }
 
 
@@ -259,48 +393,93 @@ function withdraw(address token) external nonReentrant {
 
     // === Admin Setters ===
 
-    function updateMinLpLockTime(uint256 newTime) external onlyOwner {
-        require(newTime > 0, "Invalid time");
-        minLpLockTime = newTime;
-        emit MinLpLockTimeUpdated(newTime);
-    }
+function updateMinLpLockTime(uint256 newTime)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_MIN_LP_LOCK_TIME"))
+{
+    require(newTime > 0, "Invalid time");
+    minLpLockTime = newTime;
+    emit MinLpLockTimeUpdated(newTime);
+}
 
-    function forceUpdateUnlock(address lp, uint256 newUnlockTime) external onlyOwner {
-        Lock storage l = lpLocks[lp];
-        require(l.amount > 0, "No lock exists");
-        l.unlockTime = newUnlockTime;
-        emit LockExtended(lp, newUnlockTime);
-   }
+function updateAuthorizedCaller(address _caller)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_AUTHORIZED_CALLER"))
+{
+    address old = authorizedCaller;
+    authorizedCaller = _caller;
+    emit AuthorizedCallerUpdated(old, _caller);
+}
 
+function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    require(newOwner != address(0), "Zero address");
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
 
-    function updateAuthorizedCaller(address _caller) external onlyOwner {
-        authorizedCaller = _caller;
-        emit CallerUpdated(_caller);
-    }
+function updateErc20LockFee(uint256 newFee)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_ERC20_LOCK_FEE"))
+{
+    require(newFee <= 0.1 ether, "Too high");
+    erc20LockFee = newFee;
+    emit Erc20LockFeeUpdated(newFee);
+}
 
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Zero address");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
-    }
+function updateLpLockFee(uint256 newFee)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_LP_LOCK_FEE"))
+{
+    require(newFee <= 0.1 ether, "Too high");
+    lockFee = newFee;
+    emit LpLockFeeUpdated(newFee);
+}
 
-    function updateErc20LockFee(uint256 newFee) external onlyOwner {
-        erc20LockFee = newFee;
-        require(newFee <= 0.1 ether, "Too high");
-        emit Erc20LockFeeUpdated(newFee);
-    }
+function updateMinTokenLockTime(uint256 newTime)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_MIN_TOKEN_LOCK_TIME"))
+{
+    require(newTime > 0, "Invalid time");
+    minTokenLockTime = newTime;
+    emit MinTokenLockTimeUpdated(newTime);
+}
 
-    function updateLpLockFee(uint256 newFee) external onlyOwner {
-        lockFee = newFee;
-        require(newFee <= 0.1 ether, "Too high");
-        emit LpLockFeeUpdated(newFee);
-    }
-
-    function updateMinTokenLockTime(uint256 newTime) external onlyOwner {
-        require(newTime > 0, "Invalid time");
-        minTokenLockTime = newTime;
-        emit MinTokenLockTimeUpdated(newTime);
-    }
+function getVestingLock(address token, uint256 lockId)
+    external
+    view
+    returns (
+        uint256 amount,
+        uint256 startTime,
+        uint256 initialUnlockDate,
+        uint256 releaseInterval,
+        uint256 releasePercent,
+        uint256 withdrawn,
+        address lockOwner,
+        bool active
+    )
+{
+    ERC20VestingLock memory v = vestingLocks[token][lockId];
+    return (
+        v.amount,
+        v.startTime,
+        v.initialUnlockDate,
+        v.releaseInterval,
+        v.releasePercent,
+        v.amountWithdrawn,
+        v.owner,
+        v.active
+    );
+}
 
 
 function getConfig() external view returns (

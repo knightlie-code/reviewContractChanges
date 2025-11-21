@@ -3,7 +3,9 @@ pragma solidity ^0.8.20;
 
 import "./KitchenStorage.sol";
 import "./KitchenEvents.sol";
-import "./KitchenCurveMaths.sol"; // for ethAtSupplyFromGenesis inverse
+import { KitchenCreatorBasicAdvanced as KC_BA } from "./KitchenCreatorBasicAdvanced.sol";
+import { KitchenCreatorSimple as KC_Simple } from "./KitchenCreatorSimple.sol";
+import "./KitchenTimelock.sol";
 
 /// Interfaces for the split modules
 interface IKitchenCreatorBasicAdvanced {
@@ -30,7 +32,10 @@ interface IKitchenCreatorBasicAdvanced {
         bool burnLP;
         uint256 startTime;
         uint256 finalTaxRate;
-        bool removeHeader;
+        bool removeHeader; 
+        // --- NEW MULTI-TAX WALLET SUPPORT ---
+        address[4] taxWallets;  // Up to 4 wallets
+        uint8[4]   taxSplits;   // Percentages (sum = 100)
     }
 
     struct StaticCurveParams {
@@ -69,7 +74,8 @@ interface IKitchenCreatorBasicAdvanced {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
+        address[4] calldata taxWallets,
+        uint8[4] calldata taxSplits
     ) external payable;
 
     function createAdvancedTokenStealth(
@@ -77,7 +83,8 @@ interface IKitchenCreatorBasicAdvanced {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
+        address[4] calldata taxWallets,
+        uint8[4] calldata taxSplits
     ) external payable;
 
     function syncAuthorizations() external;
@@ -121,6 +128,7 @@ interface IKitchenDeployer {
 error NotOwner();
 error NotGraduationOrCurve();
 error OnlyCurve();
+error OnlyGraduation();
 error HeaderFlagNotCreator();
 error CapOutOfBounds(uint256 ethAtCap, uint256 minEthAtCap, uint256 maxEthAtCap);
 error BadCap(uint256 graduationCap, uint256 totalSupply);
@@ -129,15 +137,41 @@ error InsufficientCreationFee(uint256 required, uint256 provided);
 /**
  * @title KitchenFactory (Thin Dispatcher)
  */
-contract KitchenFactory is KitchenEvents {
-    // --- constants ---
-    uint256 public constant BASE_FEE_BASIC       = 0.003 ether;
-    uint256 public constant BASE_FEE_ADVANCED    = 0.006 ether;
-    uint256 public constant BASE_FEE_SUPERSIMPLE = 0.001 ether;
-    uint256 public constant BASE_FEE_ZEROSIMPLE  = 0.0005 ether;
+contract KitchenFactory is KitchenEvents, KitchenTimelock {
+uint256 public BASE_FEE_BASIC       = 0.003 ether;
+uint256 public BASE_FEE_ADVANCED    = 0.006 ether;
+uint256 public BASE_FEE_SUPERSIMPLE = 0.001 ether;
+uint256 public BASE_FEE_ZEROSIMPLE  = 0.0005 ether;
 
-    uint256 public constant HEADERLESS_FEE = 0.001 ether;
-    uint256 public constant STEALTH_FEE    = 0.003 ether;
+uint256 public HEADERLESS_FEE = 0.001 ether;
+uint256 public STEALTH_FEE    = 0.003 ether;
+
+event CreationFeesUpdated(uint256 BASIC, uint256 ADVANCED, uint256 SUPERSIMPLE, uint256 ZEROSIMPLE);
+event ModeFeesUpdated(uint256 HEADERLESS, uint256 STEALTH);
+
+function updateCreationFees(
+    uint256 _BASIC,
+    uint256 _ADVANCED,
+    uint256 _SUPERSIMPLE,
+    uint256 _ZEROSIMPLE
+) external onlyOwner timelocked(keccak256("UPDATE_FEES")) {
+    BASE_FEE_BASIC       = _BASIC;
+    BASE_FEE_ADVANCED    = _ADVANCED;
+    BASE_FEE_SUPERSIMPLE = _SUPERSIMPLE;
+    BASE_FEE_ZEROSIMPLE  = _ZEROSIMPLE;
+    emit CreationFeesUpdated(_BASIC, _ADVANCED, _SUPERSIMPLE, _ZEROSIMPLE);
+}
+
+function updateModeFees(uint256 _HEADERLESS, uint256 _STEALTH)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_FEES"))
+{
+    HEADERLESS_FEE = _HEADERLESS;
+    STEALTH_FEE    = _STEALTH;
+    emit ModeFeesUpdated(_HEADERLESS, _STEALTH);
+}
+
 
     // Core state
     KitchenStorage public storageContract;
@@ -187,26 +221,36 @@ contract KitchenFactory is KitchenEvents {
 
     event AntiPvpCooldownUpdated(uint256 newCooldown);
 
-    function setAntiPvpCooldown(uint256 newCooldown) external onlyOwner {
+    function setAntiPvpCooldown(uint256 newCooldown) external onlyOwner timelocked(keccak256("UPDATE_ANTIPVP"))  {
         require(newCooldown >= 1 days && newCooldown <= 7 days, "Invalid cooldown");
         antiPvpCooldown = newCooldown;
         emit AntiPvpCooldownUpdated(newCooldown);
     }
 
-    // ---------------- wiring ----------------
-    function setCreatorBasicAdvanced(address a) external onlyOwner { creatorBA = IKitchenCreatorBasicAdvanced(a); }
-    function setCreatorSimple(address a) external onlyOwner { creatorSimple = IKitchenCreatorSimpleSplit(a); }
-    function setDeployer(address a) external onlyOwner { deployer = IKitchenDeployer(a); }
+// ---------------- wiring ----------------
+function setCreatorBasicAdvanced(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) {
+    creatorBA = IKitchenCreatorBasicAdvanced(a);
+    // removed internal .setFactory() call
+}
 
-    function setBondingCurve(address a) external onlyOwner { bondingCurve = a; }
-    function setRouter(address a) external onlyOwner { router = a; }
-    function setStorageContract(address a) external onlyOwner { storageContract = KitchenStorage(a); }
-    function setTreasury(address a) external onlyOwner { steakhouseTreasury = a; }
-    function setKitchen(address a) external onlyOwner { kitchen = a; }
-    function setGraduation(address a) external onlyOwner { graduation = a; }
+function setCreatorSimple(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) {
+    creatorSimple = IKitchenCreatorSimpleSplit(a);
+    // removed internal .setFactory() call
+}
+
+
+
+    function setDeployer(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { deployer = IKitchenDeployer(a); }
+
+    function setBondingCurve(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { bondingCurve = a; }
+    function setRouter(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { router = a; }
+    function setStorageContract(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { storageContract = KitchenStorage(a); }
+    function setTreasury(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { steakhouseTreasury = a; }
+    function setKitchen(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { kitchen = a; }
+    function setGraduation(address a) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { graduation = a; }
 
     // ---------------- auth sync ----------------
-    function syncAuthorizations() external onlyOwner {
+    function syncAuthorizations() external onlyOwner timelocked(keccak256("SYNC_AUTHORIZATIONS")) {
     // Authorize core modules in the storage contract. Called once after
     // deployment/wiring to grant modules write access to storage.
     storageContract.authorizeModule(address(this));
@@ -219,18 +263,18 @@ contract KitchenFactory is KitchenEvents {
         if (address(creatorSimple) != address(0)) creatorSimple.syncAuthorizations();
     }
 
+    function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    require(newOwner != address(0), "Zero address");
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
+
     // ---------------- helpers ----------------
-    function _enforceCapBounds(uint256 totalSupply, uint256 graduationCap) internal view {
-        if (graduationCap == 0 || graduationCap >= totalSupply) {
-            revert BadCap(graduationCap, totalSupply);
-        }
-        uint256 ethAtCap = KitchenCurveMaths.ethAtSupplyFromGenesis(totalSupply, graduationCap);
-        uint256 minEth = storageContract.minEthAtCap();
-        uint256 maxEth = storageContract.maxEthAtCap();
-        if (ethAtCap < minEth || ethAtCap > maxEth) {
-            revert CapOutOfBounds(ethAtCap, minEth, maxEth);
-        }
-    }
 
 function _normalize(string memory str) internal pure returns (string memory) {
     bytes memory b = bytes(str);
@@ -254,11 +298,6 @@ function _checkAndRecordName(string memory name, string memory symbol) internal 
     _lastLaunchTimestamp[key] = block.timestamp;
 }
 
-
-    // Helper: validate that the chosen graduation cap maps to an ETH pool within
-    // configured global bounds. This prevents token creators from choosing caps
-    // that would be unrealistic or unsafe for a launch.
-
     function _collectFees(uint256 baseFee, bool removeHeader, bool isStealth) internal returns (uint256 remaining) {
         uint256 required = baseFee;
         if (removeHeader) required += HEADERLESS_FEE;
@@ -274,78 +313,103 @@ function _checkAndRecordName(string memory name, string memory symbol) internal 
     return msg.value - required;
     }
 
-    // ---------------- create flows ----------------
-    function createBasicToken(
-        IKitchenCreatorBasicAdvanced.BasicParamsBasic calldata b,
-        IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
-        address creator
-    ) external payable {
-        _checkAndRecordName(b.name, b.symbol);
-        _enforceCapBounds(b.totalSupply, b.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_BASIC, b.removeHeader, false);
-        creatorBA.createBasicToken{value: forward}(b, s, creator);
-    }
 
-    function createBasicTokenStealth(
-        IKitchenCreatorBasicAdvanced.BasicParamsBasic calldata b,
-        IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
-        address creator
-    ) external payable {
-        _checkAndRecordName(b.name, b.symbol);
-        _enforceCapBounds(b.totalSupply, b.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_BASIC, b.removeHeader, true);
-        creatorBA.createBasicTokenStealth{value: forward}(b, s, creator);
-    }
+// ---------------- create flows ----------------
+function createBasicToken(
+    IKitchenCreatorBasicAdvanced.BasicParamsBasic calldata b,
+    IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
+    address creator
+) external payable {
+    _checkAndRecordName(b.name, b.symbol);
+    if (b.graduationCap == 0) revert BadCap(b.graduationCap, b.totalSupply);
 
-    function createAdvancedToken(
-        IKitchenCreatorBasicAdvanced.BasicParamsAdvanced calldata b,
-        IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
-        IKitchenCreatorBasicAdvanced.AdvancedParamsInput calldata a,
-        address creator,
-        address taxWallet
-    ) external payable {
-        _checkAndRecordName(b.name, b.symbol);
-        _enforceCapBounds(b.totalSupply, b.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_ADVANCED, b.removeHeader, false);
-        creatorBA.createAdvancedToken{value: forward}(b, s, a, creator, taxWallet);
-    }
+    uint256 forward = _collectFees(BASE_FEE_BASIC, b.removeHeader, false);
+    creatorBA.createBasicToken{value: forward}(b, s, creator);
+}
 
-    function createAdvancedTokenStealth(
-        IKitchenCreatorBasicAdvanced.BasicParamsAdvanced calldata b,
-        IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
-        IKitchenCreatorBasicAdvanced.AdvancedParamsInput calldata a,
-        address creator,
-        address taxWallet
-    ) external payable {
-        _checkAndRecordName(b.name, b.symbol);
-        _enforceCapBounds(b.totalSupply, b.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_ADVANCED, b.removeHeader, true);
-        creatorBA.createAdvancedTokenStealth{value: forward}(b, s, a, creator, taxWallet);
-    }
+function createBasicTokenStealth(
+    IKitchenCreatorBasicAdvanced.BasicParamsBasic calldata b,
+    IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
+    address creator
+) external payable {
+    _checkAndRecordName(b.name, b.symbol);
+    if (b.graduationCap == 0) revert BadCap(b.graduationCap, b.totalSupply);
 
-    function createSuperSimpleToken(
-        KitchenStorage.TokenSuperSimple calldata meta,
-        uint256 startTime,
-        bool isStealth,
-        address creator
-    ) external payable {
-        _checkAndRecordName(meta.name, meta.symbol);
-        _enforceCapBounds(meta.totalSupply, meta.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_SUPERSIMPLE, meta.removeHeader, isStealth);
-        creatorSimple.createSuperSimpleToken{value: forward}(meta, startTime, isStealth, creator);
-    }
+    uint256 forward = _collectFees(BASE_FEE_BASIC, b.removeHeader, true);
+    creatorBA.createBasicTokenStealth{value: forward}(b, s, creator);
+}
 
-    function createZeroSimpleToken(
-        KitchenStorage.TokenZeroSimple calldata meta,
-        uint256 startTime,
-        bool isStealth,
-        address creator
-    ) external payable {
-        _checkAndRecordName(meta.name, meta.symbol);
-        _enforceCapBounds(meta.totalSupply, meta.graduationCap);
-        uint256 forward = _collectFees(BASE_FEE_ZEROSIMPLE, meta.removeHeader, isStealth);
-        creatorSimple.createZeroSimpleToken{value: forward}(meta, startTime, isStealth, creator);
-    }
+
+
+function createAdvancedToken(
+    IKitchenCreatorBasicAdvanced.BasicParamsAdvanced calldata b,
+    IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
+    IKitchenCreatorBasicAdvanced.AdvancedParamsInput calldata a,
+    address creator,
+    address[4] calldata taxWallets,
+    uint8[4] calldata taxSplits
+) external payable {
+    _checkAndRecordName(b.name, b.symbol);
+    if (b.graduationCap == 0) revert BadCap(b.graduationCap, b.totalSupply);
+
+    uint256 forward = _collectFees(BASE_FEE_ADVANCED, b.removeHeader, false);
+    creatorBA.createAdvancedToken{value: forward}(b, s, a, creator, taxWallets, taxSplits);
+
+}
+
+
+
+function createAdvancedTokenStealth(
+    IKitchenCreatorBasicAdvanced.BasicParamsAdvanced calldata b,
+    IKitchenCreatorBasicAdvanced.StaticCurveParams calldata s,
+    IKitchenCreatorBasicAdvanced.AdvancedParamsInput calldata a,
+    address creator,
+    address[4] calldata taxWallets,
+    uint8[4] calldata taxSplits
+) external payable {
+    _checkAndRecordName(b.name, b.symbol);
+    if (b.graduationCap == 0) revert BadCap(b.graduationCap, b.totalSupply);
+
+    uint256 forward = _collectFees(BASE_FEE_ADVANCED, b.removeHeader, true);
+    creatorBA.createAdvancedTokenStealth{value: forward}(b, s, a, creator, taxWallets, taxSplits);
+
+}
+
+
+
+function createSuperSimpleToken(
+    KitchenStorage.TokenSuperSimple calldata meta,
+    uint256 startTime,
+    bool isStealth,
+    address creator
+) external payable {
+    _checkAndRecordName(meta.name, meta.symbol);
+    if (meta.graduationCap == 0) revert BadCap(meta.graduationCap, meta.totalSupply);
+
+    uint256 forward = _collectFees(BASE_FEE_SUPERSIMPLE, meta.removeHeader, isStealth);
+    creatorSimple.createSuperSimpleToken{value: forward}(meta, startTime, isStealth, creator);
+
+
+}
+
+
+
+function createZeroSimpleToken(
+    KitchenStorage.TokenZeroSimple calldata meta,
+    uint256 startTime,
+    bool isStealth,
+    address creator
+) external payable {
+    _checkAndRecordName(meta.name, meta.symbol);
+    if (meta.graduationCap == 0) revert BadCap(meta.graduationCap, meta.totalSupply);
+
+    uint256 forward = _collectFees(BASE_FEE_ZEROSIMPLE, meta.removeHeader, isStealth);
+    creatorSimple.createZeroSimpleToken{value: forward}(meta, startTime, isStealth, creator);
+
+
+}
+
+
 
     // ---------------- deploy/mint ----------------
     function deployToken(
@@ -358,24 +422,12 @@ function _checkAndRecordName(string memory name, string memory symbol) internal 
         uint256 finalTaxRate,
         uint256 maxSupply
     ) external payable returns (address tokenAddress) {
-        if (msg.sender != graduation && msg.sender != bondingCurve) revert OnlyCurve();
+        if (msg.sender != graduation) revert OnlyGraduation();
         return deployer.deployToken{value: msg.value}(name, symbol, creator, taxWallet, isTax, removeHeader, finalTaxRate, maxSupply);
     }
 
     function mintRealToken(address token, address to, uint256 amount) external onlyGraduation {
         deployer.mintRealToken(token, to, amount);
-    }
-
-    // ---------------- header flag ----------------
-    function setRemoveHeaderFlag(address token, bool flag) external {
-        address creatorAddr =
-            storageContract.getTokenBasic(token).creator != address(0) ? storageContract.getTokenBasic(token).creator :
-            storageContract.getTokenAdvanced(token).creator != address(0) ? storageContract.getTokenAdvanced(token).creator :
-            storageContract.getTokenSuperSimple(token).creator != address(0) ? storageContract.getTokenSuperSimple(token).creator :
-            storageContract.getTokenZeroSimple(token).creator;
-
-        if (creatorAddr != msg.sender) revert HeaderFlagNotCreator();
-        storageContract.setRemoveHeader(token, flag);
     }
 
     // ---------------- views ----------------

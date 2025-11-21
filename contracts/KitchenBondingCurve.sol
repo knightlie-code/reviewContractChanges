@@ -6,10 +6,15 @@ import "./KitchenCurveMaths.sol";
 import "./KitchenStorage.sol";
 import "./KitchenUtils.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./KitchenTimelock.sol";
+import { IKitchenOracles as IKitchenOraclesBonding } from "./interfaces/IKitchenOracles.sol";
+
+
 
 interface IKitchenGraduation {
     function graduateToken(address token, address stipendReceiver) external;
 }
+
 
 /**
  * @title KitchenBondingCurve
@@ -21,7 +26,7 @@ interface IKitchenGraduation {
  * - If token is TAX, 10% of the curve tax is skimmed to treasury, 90% to payee.
  * - Removed accruedEth + claimAccrued/getAccrued.
  */
-contract KitchenBondingCurve is KitchenEvents, ReentrancyGuard {
+contract KitchenBondingCurve is KitchenEvents, KitchenTimelock, ReentrancyGuard {
     KitchenStorage public storageContract;
     KitchenUtils public utilsContract;
     address public owner;
@@ -38,9 +43,6 @@ contract KitchenBondingCurve is KitchenEvents, ReentrancyGuard {
     // Optional new events — add to KitchenEvents if you want explicit signals
     // event DevFeePaid(address indexed token, address indexed payee, uint256 amount);
 
-// Base stipend used for graduation gas refund.
-// This will scale depending on holder count tiers.
-uint256 public stipendBase = 0.003 ether;
 
     // ---------------- structs ----------------
     struct State {
@@ -96,31 +98,113 @@ uint256 public stipendBase = 0.003 ether;
     }
 
     // ---------------- admin ----------------
-    function syncAuthorizations() external onlyOwner {
+    function syncAuthorizations() external onlyOwner timelocked(keccak256("SYNC_AUTHORIZATIONS")) {
         storageContract.authorizeCaller(address(this), true);
     }
-    function updateStorage(address s) external onlyOwner { storageContract = KitchenStorage(s); }
-    function updateUtils(address u) external onlyOwner { utilsContract = KitchenUtils(u); }
-    function updateGraduation(address g) external onlyOwner { graduation = g; }
-    function updateTreasury(address t) external onlyOwner { steakhouseTreasury = t; }
-    function setKitchen(address _kitchen) external onlyOwner { kitchen = _kitchen; }
+    function updateStorage(address s) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { storageContract = KitchenStorage(s); }
+    function updateUtils(address u) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { utilsContract = KitchenUtils(u); }
+    function updateGraduation(address g) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { graduation = g; }
+    function updateTreasury(address t) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { steakhouseTreasury = t; }
+    function setKitchen(address _kitchen) external onlyOwner timelocked(keccak256("UPDATE_MODULES")) { kitchen = _kitchen; }
 
-    event StipendBaseUpdated(uint256 oldValue, uint256 newValue);
+// === Stipend configuration ===
+uint256 public stipendBase = 0.003 ether; // floor
+uint256 public stipendHardCap = 0.15 ether;
+uint256 public stipendSafetyNum = 150; // 150%
+uint256 public stipendSafetyDen = 100;
 
-    function updateStipendBase(uint256 newBase) external onlyOwner {
-        require(newBase > 0 && newBase <= 0.02 ether, "Invalid stipend");
-        emit StipendBaseUpdated(stipendBase, newBase);
-        stipendBase = newBase;
-    }
+// --- Oracle freshness windows ---
+uint256 public constant ORACLE_MAX_AGE = 10_800;    // 3 hours for ETH/USD
+uint256 public constant GAS_ORACLE_MAX_AGE = 900;   // 15 minutes for gas price
+
+// Gas tiers based on measured graduation gas ranges
+uint256 public gasUnitsTier1 = 5_000_000;  // ≤50 holders
+uint256 public gasUnitsTier2 = 7_000_000;  // 51–100
+uint256 public gasUnitsTier3 = 11_000_000; // 101–200
+uint256 public gasUnitsTier4 = 16_000_000; // 201–300
+
+event StipendBaseUpdated(uint256 oldValue, uint256 newValue);
+event StipendGasUnitsUpdated(uint256 t1, uint256 t2, uint256 t3, uint256 t4);
+event StipendSafetyUpdated(uint256 num, uint256 den);
+event StipendHardCapUpdated(uint256 oldValue, uint256 newValue);
+
+function updateStipendBase(uint256 newBase)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STIPEND_BASE"))
+{
+    require(newBase > 0 && newBase <= 0.05 ether, "Invalid base");
+    emit StipendBaseUpdated(stipendBase, newBase);
+    stipendBase = newBase;
+}
+
+function updateStipendGasUnits(uint256 t1, uint256 t2, uint256 t3, uint256 t4)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STIPEND_GASUNITS"))
+{
+    require(t1 > 0 && t2 >= t1 && t3 >= t2 && t4 >= t3, "bad tiers");
+    gasUnitsTier1 = t1;
+    gasUnitsTier2 = t2;
+    gasUnitsTier3 = t3;
+    gasUnitsTier4 = t4;
+    emit StipendGasUnitsUpdated(t1, t2, t3, t4);
+}
+
+function updateStipendSafety(uint256 num, uint256 den)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STIPEND_SAFETY"))
+{
+    require(num >= 100 && num <= 300 && den >= 100, "bad safety");
+    stipendSafetyNum = num;
+    stipendSafetyDen = den;
+    emit StipendSafetyUpdated(num, den);
+}
+
+function updateStipendHardCap(uint256 newCap)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STIPEND_CAP"))
+{
+    require(newCap >= stipendBase && newCap <= 0.1 ether, "bad cap");
+    emit StipendHardCapUpdated(stipendHardCap, newCap);
+    stipendHardCap = newCap;
+}
+
+
+
+event TreasuryCutUpdated(uint256 oldValue, uint256 newValue);
+
+function updateTreasuryCut(uint256 newCut)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_TREASURY_CUT"))
+{
+    require(newCut <= 2500, "Too high"); // ≤25%
+    emit TreasuryCutUpdated(storageContract.treasuryCutBps(), newCut);
+    storageContract.setTreasuryCutBps(newCut);
+}
+
+function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    require(newOwner != address(0), "Zero address");
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
 
 
     // ==============================
     // ENTRYPOINTS
     // ==============================
-    function buyToken(address token) external payable {
+    function buyToken(address token) external payable nonReentrant  {
         _buy(token, msg.sender, msg.value);
     }
-    function buyTokenFor(address token, address buyer) external payable onlyKitchen {
+    function buyTokenFor(address token, address buyer) external payable nonReentrant  onlyKitchen {
         _buy(token, buyer, msg.value);
     }
     function sellToken(address token, uint256 amt) external nonReentrant {
@@ -131,10 +215,10 @@ uint256 public stipendBase = 0.003 ether;
     }
 
 // ---- NEW: slippage-protected paths (optional to use; legacy still works) ----
-function buyTokenWithMinOut(address token, uint256 minTokensOut) external payable {
+function buyTokenWithMinOut(address token, uint256 minTokensOut) external payable nonReentrant  {
     _buyWithMinOut(token, msg.sender, msg.value, minTokensOut);
 }
-function buyTokenForWithMinOut(address token, address buyer, uint256 minTokensOut) external payable onlyKitchen {
+function buyTokenForWithMinOut(address token, address buyer, uint256 minTokensOut) external payable nonReentrant  onlyKitchen {
     _buyWithMinOut(token, buyer, msg.value, minTokensOut);
 }
 function sellTokenWithMinOut(address token, uint256 amt, uint256 minEthOut) external nonReentrant {
@@ -195,21 +279,7 @@ function _buyWithMinOut(address token, address buyer, uint256 ethIn, uint256 min
     // Compute fees + intended poolDelta
     BuyLocal memory L = _computeBuyOutcome(st, ethIn, feeBps, devPerc);
 
-    // ---- Clamp by maxEthAtCap BEFORE calculating limits, and recompute tokensOut if clamped ----
-    uint256 maxEthAtCap = storageContract.maxEthAtCap();
-    uint256 allowedPoolDelta = st.ethPool >= maxEthAtCap ? 0 : (maxEthAtCap - st.ethPool);
-
-    if (L.poolDelta > allowedPoolDelta) {
-        // Reduce the portion that touches the pool; refund only the excess pool portion.
-        uint256 excess = L.poolDelta - allowedPoolDelta;
-        L.poolDelta = allowedPoolDelta;
-        L.used -= excess;
-
-        (bool okClampRefund, ) = payable(buyer).call{value: excess}("");
-        require(okClampRefund, "Clamp refund failed");
-    }
-
-    // Tokens out must reflect the (possibly clamped) poolDelta
+    // Tokens out based purely on curve maths (no ETH cap logic)
     L.tokensOut = KitchenCurveMaths.getTokensForEth(
         st.totalSupply, st.ethPool, st.circ, L.poolDelta
     );
@@ -219,12 +289,16 @@ function _buyWithMinOut(address token, address buyer, uint256 ethIn, uint256 min
         require(L.tokensOut >= minTokensOut, "Slippage: tokensOut < min");
     }
 
-    // Limits (use final tokensOut)
-    require(L.tokensOut <= utilsContract.getCurrentMaxTx(token), "Exceeds maxTx");
+    // --- MAXTX / MAXWALLET with 6s CREATOR EXEMPTION ---
+    (address creator, uint256 exemptUntil) = storageContract.getCreatorExemptInfo(token);
     uint256 userBalance = storageContract.userBalances(buyer, token);
-    require(userBalance + L.tokensOut <= utilsContract.getCurrentMaxWallet(token), "Exceeds maxWallet");
 
-    // Commit state (clamped)
+    if (!(buyer == creator && block.timestamp <= exemptUntil)) {
+        require(L.tokensOut <= utilsContract.getCurrentMaxTx(token), "Exceeds maxTx");
+        require(userBalance + L.tokensOut <= utilsContract.getCurrentMaxWallet(token), "Exceeds maxWallet");
+    }
+
+    // Commit new state
     uint256 newEthPool = st.ethPool + L.poolDelta;
     uint256 newCirc    = st.circ + L.tokensOut;
     storageContract.updateTokenState(token, newEthPool, newCirc);
@@ -264,7 +338,7 @@ function _buyWithMinOut(address token, address buyer, uint256 ethIn, uint256 min
         }
     }
 
-    // Refund any leftover from msg.value (should be only rounding remnants if any)
+    // Final refund (safe, after all updates & fees)
     if (ethIn > L.used) {
         (bool okRf, ) = payable(buyer).call{value: ethIn - L.used}("");
         require(okRf, "Refund failed");
@@ -273,13 +347,14 @@ function _buyWithMinOut(address token, address buyer, uint256 ethIn, uint256 min
     emit Buy(buyer, token, L.used, L.tokensOut, userBalance + L.tokensOut);
     emit CurveSync(token, newEthPool, newCirc);
 
-    // Auto-graduation (cap+overshoot check)
+    // Auto-graduation purely by token cap + overshoot tolerance
     uint256 overshootCap = st.cap + (st.cap * storageContract.overshootBps()) / 10_000;
     if (newCirc >= st.cap) {
         require(newCirc <= overshootCap, "Exceeds overshoot limit");
         IKitchenGraduation(graduation).graduateToken(token, buyer);
     }
 }
+
 
 function _sell(address token, address seller, uint256 amt) internal {
     // Backward-compatible path: no slippage check
@@ -447,6 +522,61 @@ function _sellWithMinOut(address token, address seller, uint256 amt, uint256 min
         return storageContract.getTokenZeroSimple(token).tokenType == KitchenStorage.TokenType.TAX;
     }
 
+function _readEthUsdPrice(address oracleAddr) internal view returns (uint256 price, uint256 updatedAt) {
+    if (oracleAddr == address(0)) return (0, 0);
+    (bool ok, bytes memory data) = oracleAddr.staticcall(
+        abi.encodeWithSignature("ethUsd()")
+    );
+    if (ok && data.length >= 64) {
+        (price, updatedAt) = abi.decode(data, (uint256, uint256));
+    }
+}
+
+
+function _gasPriceWei() internal view returns (uint256) {
+    // fallback
+    uint256 baseFee = block.basefee;
+    uint256 gasPrice = baseFee < 1 gwei ? 1 gwei : baseFee;
+
+    // get oracle address from utils
+    address oracleAddr;
+    try utilsContract.oracle() returns (address addr) {
+        oracleAddr = addr;
+    } catch {
+        oracleAddr = address(0);
+    }
+
+if (oracleAddr != address(0)) {
+    // encode selector for gasWei()
+    (bool ok, bytes memory data) = oracleAddr.staticcall(
+        abi.encodeWithSignature("gasWei()")
+    );
+
+    if (ok && data.length >= 64) {
+        (uint256 price, uint256 updatedAt) = abi.decode(data, (uint256, uint256));
+        // Only accept fresh gas price; otherwise keep fallback (basefee or 1 gwei)
+        if (price > 0 && updatedAt != 0 && block.timestamp - updatedAt <= GAS_ORACLE_MAX_AGE) {
+            gasPrice = price;
+        }
+    }
+}
+
+
+    return gasPrice;
+}
+
+
+
+
+
+function _gasUnitsForHolders(uint256 holderCount) internal view returns (uint256) {
+    if (holderCount <= 50) return gasUnitsTier1;
+    if (holderCount <= 100) return gasUnitsTier2;
+    if (holderCount <= 200) return gasUnitsTier3;
+    return gasUnitsTier4;
+}
+
+
 /// @dev returns (toTreasury, toPayee)
 function _splitTaxForToken(address token, uint256 df) internal view returns (uint256, uint256) {
     if (df == 0) return (0, 0);
@@ -461,16 +591,20 @@ function _splitTaxForToken(address token, uint256 df) internal view returns (uin
 }
 
 
-    /// @notice Computes stipend amount based on current holder count.
-    /// @dev Uses rough gas-based scaling; updateable tiers to keep cost coverage fair.
-    function getDynamicStipend(uint256 holderCount) public view returns (uint256) {
-        if (holderCount <= 50) return stipendBase;                // ≈0.003 ETH
-        else if (holderCount <= 100) return stipendBase * 2;      // ≈0.006 ETH
-        else if (holderCount <= 250) return stipendBase * 3;      // ≈0.009 ETH
-        else if (holderCount <= 500) return stipendBase * 4;      // ≈0.012 ETH
-        else if (holderCount <= 1000) return stipendBase * 6;     // ≈0.018 ETH
-        else return stipendBase * 8;                              // ≥1000 holders → ≈0.024 ETH
-    }
+function getDynamicStipend(uint256 holderCount) public view returns (uint256) {
+    uint256 gasUnits = _gasUnitsForHolders(holderCount);
+    uint256 gasWei = _gasPriceWei();
+
+    // raw = gasUnits * gasWei
+    uint256 raw = gasUnits * gasWei;
+    uint256 padded = (raw * stipendSafetyNum) / stipendSafetyDen;
+
+    if (padded < stipendBase) padded = stipendBase;
+    if (padded > stipendHardCap) padded = stipendHardCap;
+
+    return padded;
+}
+
 
 
     function getConfig() external view returns (

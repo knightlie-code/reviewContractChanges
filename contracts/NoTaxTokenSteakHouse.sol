@@ -5,11 +5,11 @@ pragma solidity ^0.8.20;
 //  🥩 STEAKHOUSE — Clean. Curve. Contracts.
 
    SteakHouse Finance | NoTax Token Contract
-   📲 dapp:      https://steakhouse.finance
-   ✖️ x:         https://x.com/steakhouse_fi
-   📤 telegram:  https://t.me/steakhouse_fi
+   📲 home:      https://steakhouse.finance
+   ✖️ x:         https://x.com/steak_tech
+   📤 telegram:  https://t.me/steakhouse
    🔒 locker:    https://locker.steakhouse.finance
-   📈 curve:     https://app.steakhouse.finance/token/[token]
+   📈 curve:     https://curve.steakhouse.finance
 
    This contract is deployed by SteakHouse Finance.
    Contains no tax or ownership logic.

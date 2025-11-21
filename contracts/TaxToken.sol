@@ -4,11 +4,10 @@ pragma solidity ^0.8.20;
 import "./interfaces/IUniswapV2Router02.sol";
 import "./interfaces/IUniswapV2Factory.sol";
 
-
 /**
  * @title TaxToken
  * @notice ERC20 (18 decimals) with:
- *  - final tax (PERCENT, max 5%) → tokens accrue in this contract and are swapped to ETH → taxWallet
+ *  - final tax (PERCENT, max 5%) → tokens accrue in this contract and are swapped to ETH → split across wallets
  */
 contract TaxToken {
     // --- ERC20 basics ---
@@ -20,7 +19,6 @@ contract TaxToken {
     uint256 public totalSupply;         // minted so far
     address public pair;
 
-
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
@@ -30,13 +28,14 @@ contract TaxToken {
     // platform skim to treasury on each transfer, in BPS (e.g. 30 => 0.30%)
     uint256 public constant feeRate = 30;
 
-    // tokens held by this contract are swapped to ETH and sent to taxWallet when threshold reached
+    // tokens held by this contract are swapped to ETH when threshold reached
     uint256 public swapThreshold;
 
     // --- Roles / endpoints ---
-    address public immutable taxWallet;          // receives ETH from swapBack
-    address public immutable steakhouseTreasury; // receives token skim (feeRate in bps)
-    address public immutable minter;             // KitchenDeployer (onlyMinter)
+    address[4] public taxWallets;       // Up to 4 dev/marketing/revshare wallets
+    uint8[4] public taxSplits;          // % shares (sum = 100)
+    address public immutable steakhouseTreasury;
+    address public immutable minter;
     IUniswapV2Router02 public immutable router;
 
     bool private swapping;
@@ -53,28 +52,43 @@ contract TaxToken {
         _;
     }
 
+    // =============================================================
+    // Constructor
+    // =============================================================
     constructor(
         string memory _name,
         string memory _symbol,
         uint256 _maxSupply,
         uint256 _taxRate,           // PERCENT (0–5)
-        address _taxWallet,
         address _steakhouseTreasury,
-        address _router
+        address _router,
+        address[4] memory taxWallets_,
+        uint8[4] memory taxSplits_
     ) {
-       // --- input validation ---
-       require(bytes(_name).length > 0 && bytes(_symbol).length > 0, "Invalid name/symbol");
-       require(_maxSupply > 1e18 && _maxSupply <= 1_000_000_000_000 * 1e18, "Invalid supply");
-       require(_taxRate <= 5 && _taxRate >= 1, "Invalid taxRate");
-       require(_taxWallet != address(0) && _steakhouseTreasury != address(0) && _router != address(0), "zero addr");
-        
+        // --- input validation ---
+        require(bytes(_name).length > 0 && bytes(_symbol).length > 0, "Invalid name/symbol");
+        require(_maxSupply > 1e18 && _maxSupply <= 1_000_000_000_000 * 1e18, "Invalid supply");
+        require(_taxRate <= 5 && _taxRate >= 1, "Invalid taxRate");
+        require(_steakhouseTreasury != address(0) && _router != address(0), "zero addr");
+
         name = _name;
         symbol = _symbol;
         maxSupply = _maxSupply;
         taxRate = _taxRate;
-        taxWallet = _taxWallet;
         steakhouseTreasury = _steakhouseTreasury;
         router = IUniswapV2Router02(_router);
+        minter = msg.sender;
+
+        // --- assign multi-wallet tax setup ---
+        uint8 totalSplit = 0;
+        for (uint8 i = 0; i < 4; i++) {
+            taxWallets[i] = taxWallets_[i];
+            taxSplits[i] = taxSplits_[i];
+            totalSplit += taxSplits_[i];
+        }
+        require(totalSplit == 100, "Invalid tax split total");
+
+        // --- create pair if needed ---
         address _factory = router.factory();
         address _pair = IUniswapV2Factory(_factory).getPair(address(this), router.WETH());
         if (_pair == address(0)) {
@@ -82,13 +96,13 @@ contract TaxToken {
         }
         pair = _pair;
 
-        minter = msg.sender;
-
         // Reasonable initial threshold (can be updated after minting)
         swapThreshold = (_maxSupply * 25) / 100_000; // 0.025%
     }
 
-    // --- Admin (Factory/minter) ---
+    // =============================================================
+    // Admin (Factory/minter)
+    // =============================================================
     function setSwapThreshold(uint256 newThreshold) external onlyMinter {
         swapThreshold = newThreshold;
         emit SwapThresholdUpdated(newThreshold);
@@ -100,7 +114,9 @@ contract TaxToken {
         emit TaxRateUpdated(newRatePercent);
     }
 
-    // --- Minting ---
+    // =============================================================
+    // Minting
+    // =============================================================
     function mint(address to, uint256 amount) external onlyMinter {
         require(to != address(0), "zero addr");
         uint256 newTotal = totalSupply + amount;
@@ -110,7 +126,9 @@ contract TaxToken {
         emit Transfer(address(0), to, amount);
     }
 
-    // --- ERC20 ---
+    // =============================================================
+    // ERC20
+    // =============================================================
     function transfer(address to, uint256 amount) external returns (bool) {
         _transfer(msg.sender, to, amount);
         return true;
@@ -130,25 +148,26 @@ contract TaxToken {
         return true;
     }
 
-    // --- Core transfer with taxes ---
+    // =============================================================
+    // Core transfer with taxes
+    // =============================================================
     function _transfer(address from, address to, uint256 amount) internal {
         require(to != address(0), "zero addr");
         require(amount > 0, "amount=0");
 
-// Swap before moving balances (avoid reentrancy via `swapping` flag)
-// Skip if msg.sender is router OR from == address(this) OR to == address(this)
-if (
-    !swapping &&
-    msg.sender != address(router) &&
-    msg.sender != pair && // exclude LP pair
-    from != address(this) &&
-    to != address(this)
-) {
-    uint256 bal = balanceOf[address(this)];
-    if (bal >= swapThreshold && swapThreshold > 0) {
-        _swapBack(bal);
-    }
-}
+        // Swap before moving balances (avoid reentrancy)
+        if (
+            !swapping &&
+            msg.sender != address(router) &&
+            msg.sender != pair &&
+            from != address(this) &&
+            to != address(this)
+        ) {
+            uint256 bal = balanceOf[address(this)];
+            if (bal >= swapThreshold && swapThreshold > 0) {
+                _swapBack(bal);
+            }
+        }
 
         uint256 fromBal = balanceOf[from];
         require(fromBal >= amount, "balance");
@@ -164,7 +183,6 @@ if (
             balanceOf[from] = fromBal - amount;
             balanceOf[to] += sendAmount;
 
-            // Accumulate both tax + fee inside the contract
             if (taxAmount > 0) balanceOf[address(this)] += taxAmount;
             if (feeAmount > 0) balanceOf[address(this)] += feeAmount;
         }
@@ -175,7 +193,9 @@ if (
         if (feeAmount > 0) emit Transfer(from, address(this), feeAmount);
     }
 
-    // --- Swap accumulated tax+fee tokens to ETH and split ---
+    // =============================================================
+    // Swap accumulated tokens -> ETH and split
+    // =============================================================
     function _swapBack(uint256 tokensToSwap) private {
         swapping = true;
 
@@ -183,7 +203,7 @@ if (
         path[0] = address(this);
         path[1] = router.WETH();
 
-        // Approve router for max once (saves gas on repeated swaps)
+        // Approve router if needed
         if (allowance[address(this)][address(router)] < tokensToSwap) {
             allowance[address(this)][address(router)] = type(uint256).max;
             emit Approval(address(this), address(router), type(uint256).max);
@@ -194,24 +214,31 @@ if (
             tokensToSwap,
             0,
             path,
-            address(this), // ETH comes here first
+            address(this),
             block.timestamp
         );
 
         uint256 ethGained = address(this).balance;
 
         if (ethGained > 0) {
-            // Split ETH between taxWallet and steakhouseTreasury
-            uint256 totalBps = (taxRate * 100) + feeRate; // taxRate% = taxRate*100 bps
-            uint256 ethToTaxWallet = (ethGained * (taxRate * 100)) / totalBps;
-            uint256 ethToTreasury   = ethGained - ethToTaxWallet;
+            // Take Steakhouse 10% cut first
+            uint256 steakCut = (ethGained * 10) / 100;
+            uint256 remaining = ethGained - steakCut;
 
-            if (ethToTaxWallet > 0) payable(taxWallet).transfer(ethToTaxWallet);
-            if (ethToTreasury > 0) payable(steakhouseTreasury).transfer(ethToTreasury);
+            if (steakCut > 0) payable(steakhouseTreasury).transfer(steakCut);
+
+            // Distribute remainder among up to 4 wallets
+            for (uint8 i = 0; i < 4; i++) {
+                address wallet = taxWallets[i];
+                uint8 split = taxSplits[i];
+                if (wallet != address(0) && split > 0) {
+                    uint256 share = (remaining * split) / 100;
+                    payable(wallet).transfer(share);
+                }
+            }
         }
 
         balanceOf[address(this)] = 0;
         swapping = false;
     }
-
 }

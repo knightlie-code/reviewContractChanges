@@ -3,7 +3,8 @@ pragma solidity ^0.8.20;
 
 import "./KitchenStorage.sol";
 import "./KitchenEvents.sol";
-import "./KitchenUtils.sol";
+import "./KitchenTimelock.sol";
+
 
 error BasicTokenExists();
 error AdvancedTokenExists();
@@ -13,6 +14,13 @@ error OnlyNoTaxAllowed();
 error FinalTaxMustBeZero();
 error CapOutOfBounds(uint256 ethPool, uint256 min, uint256 max);
 
+// --- Governance Events ---
+event FactoryUpdated(address indexed oldFactory, address indexed newFactory);
+event StorageUpdated(address indexed oldStorage, address indexed newStorage);
+event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+event EmergencyWithdraw(address indexed to, uint256 amount);
+
+
 /**
  * @title KitchenCreatorSimple
  * @notice Handles creation of SuperSimple and ZeroSimple tokens.
@@ -20,9 +28,8 @@ error CapOutOfBounds(uint256 ethPool, uint256 min, uint256 max);
  * - ZeroSimple  = no curve tax, no limits
  * - Both only allowed as NO_TAX final type
  */
-contract KitchenCreatorSimple is KitchenEvents {
+contract KitchenCreatorSimple is KitchenEvents, KitchenTimelock {
     KitchenStorage public storageContract;
-    KitchenUtils public utils;
     address public steakhouseTreasury;
     address public owner;
 
@@ -31,18 +38,64 @@ contract KitchenCreatorSimple is KitchenEvents {
         _;
     }
 
-    constructor(address _storage, address _utils, address _treasury) {
+        // --- Access Control ---
+    address public factory;
+
+    modifier onlyFactory() {
+        require(msg.sender == factory, "Not factory");
+        _;
+    }
+
+function setFactory(address _factory)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_FACTORY"))
+{
+    address old = factory;
+    factory = _factory;
+    emit FactoryUpdated(old, _factory);
+}
+
+function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    require(newOwner != address(0), "Zero address");
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
+
+
+    constructor(address _storage, address _treasury) {
         owner = msg.sender;
         storageContract = KitchenStorage(_storage);
-        utils = KitchenUtils(_utils);
         steakhouseTreasury = _treasury;
     }
 
-    // Admin setters: change storage, utils helpers, and treasury address
+    // Admin setters: change storage and treasury address
     // These are privileged operations and update references used across creation and runtime helpers.
-    function setStorage(address s) external onlyOwner { storageContract = KitchenStorage(s); }
-    function setTreasury(address t) external onlyOwner { steakhouseTreasury = t; }
-    function setUtils(address u) external onlyOwner { utils = KitchenUtils(u); }
+function setStorage(address s)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STORAGE"))
+{
+    address old = address(storageContract);
+    storageContract = KitchenStorage(s);
+    emit StorageUpdated(old, s);
+}
+
+function setTreasury(address t)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_TREASURY"))
+{
+    address old = steakhouseTreasury;
+    steakhouseTreasury = t;
+    emit TreasuryUpdated(old, t);
+}
+
 
     // No-op shim for compatibility with orchestration scripts that call `syncAuthorizations`.
     function syncAuthorizations() external {}
@@ -64,7 +117,8 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
             graduated: false,
             createdAtBlock: block.number,
             createdAtTimestamp: block.timestamp,
-            startTime: startTime
+            startTime: startTime,
+            limitsStart: startTime
         });
         storageContract.setTokenState(token, st);
     }
@@ -83,7 +137,7 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
         KitchenStorage.TokenSuperSimple calldata meta,
         uint256 startTime,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
     // SuperSimple must be NO_TAX (no final tax) — enforced here for safety and indexer expectations.
     if (meta.tokenType != KitchenStorage.TokenType.NO_TAX) revert OnlyNoTaxAllowed();
     if (meta.finalTaxRate != 0) revert FinalTaxMustBeZero();
@@ -131,7 +185,7 @@ emit TokenCreated(
         KitchenStorage.TokenSuperSimple calldata meta,
         uint256 startTime,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
     // stealth variant - useful for off-chain stealth launches. Same validation enforced.
     if (meta.tokenType != KitchenStorage.TokenType.NO_TAX) revert OnlyNoTaxAllowed();
     if (meta.finalTaxRate != 0) revert FinalTaxMustBeZero();
@@ -162,7 +216,7 @@ emit TokenCreated(
         KitchenStorage.TokenZeroSimple calldata meta,
         uint256 startTime,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
     // ZeroSimple: minimal creation path, enforced NO_TAX and zero final tax.
     if (meta.tokenType != KitchenStorage.TokenType.NO_TAX) revert OnlyNoTaxAllowed();
     if (meta.finalTaxRate != 0) revert FinalTaxMustBeZero();
@@ -207,7 +261,7 @@ emit TokenCreated(
         KitchenStorage.TokenZeroSimple calldata meta,
         uint256 startTime,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
     // Stealth variant for ZeroSimple
     if (meta.tokenType != KitchenStorage.TokenType.NO_TAX) revert OnlyNoTaxAllowed();
     if (meta.finalTaxRate != 0) revert FinalTaxMustBeZero();
@@ -237,7 +291,7 @@ emit TokenCreated(
         uint256 startTime,
         bool isStealth,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
         if (isStealth) {
             this.createSuperSimpleTokenStealth(meta, startTime, creator);
         } else {
@@ -250,7 +304,7 @@ emit TokenCreated(
         uint256 startTime,
         bool isStealth,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
         if (isStealth) {
             this.createZeroSimpleTokenStealth(meta, startTime, creator);
         } else {
@@ -260,16 +314,33 @@ emit TokenCreated(
 
     function getConfig() external view returns (
     address _storageContract,
-    address _utils,
     address _treasury,
     address _owner
 ) {
     return (
         address(storageContract),
-        address(utils),
         steakhouseTreasury,
         owner
     );
 }
+
+// ==========================================================
+// Safety: Prevent stuck ETH (SFA-12 fix)
+// ==========================================================
+receive() external payable {}
+
+function withdraw(address payable to)
+    external
+    onlyOwner
+    timelocked(keccak256("EMERGENCY_WITHDRAW"))
+{
+    require(to != address(0), "Zero address");
+    uint256 amt = address(this).balance;
+    require(amt > 0, "No balance");
+    (bool ok, ) = to.call{value: amt}("");
+    require(ok, "Withdraw failed");
+    emit EmergencyWithdraw(to, amt);
+}
+
 
 }

@@ -3,6 +3,11 @@ pragma solidity ^0.8.20;
 
 import "./KitchenStorage.sol";
 import "./KitchenEvents.sol";
+import "./KitchenTimelock.sol";
+import "./vendor/chainlink/AggregatorV3Interface.sol";
+import "./KitchenCurveMaths.sol"; 
+
+
 
 interface IKitchenFactory {
     struct BasicParamsBasic {
@@ -61,7 +66,8 @@ interface IKitchenFactory {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
+        address[4] calldata taxWallets,
+        uint8[4] calldata taxSplits
     ) external payable;
 
     function createBasicTokenStealth(
@@ -75,7 +81,8 @@ interface IKitchenFactory {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
+        address[4] calldata taxWallets,
+        uint8[4] calldata taxSplits
     ) external payable;
 
     function createSuperSimpleToken(
@@ -168,9 +175,13 @@ interface IKitchenBondingCurve {
 interface IKitchenGraduation {
     function graduateToken(address token, address stipendReceiver) external;
 }
+/* ---------------- Chainlink Oracle Wrapper ---------------- */
+interface IKitchenOracles {
+    function ethUsd() external view returns (uint256 price, uint256 updatedAt);
+}
 
 /// @title Kitchen Router
-contract Kitchen is KitchenEvents {
+contract Kitchen is KitchenEvents, KitchenTimelock {
     address public owner;
 
     modifier onlyOwner() {
@@ -184,6 +195,17 @@ contract Kitchen is KitchenEvents {
     KitchenStorage public storageContract;
 
     IKitchenDeployer public deployer;            // curve-based deployer
+    IKitchenOracles public oracle; // Chainlink-based oracle adapter
+
+
+
+// --- Governance Events ---
+event FactoryUpdated(address indexed oldFactory, address indexed newFactory);
+event BondingCurveUpdated(address indexed oldBondingCurve, address indexed newBondingCurve);
+event GraduationUpdated(address indexed oldGraduation, address indexed newGraduation);
+event DeployerUpdated(address indexed oldDeployer, address indexed newDeployer);
+event EmergencyWithdraw(address indexed to, uint256 amount);
+
 
     // ---- validation constants ----
 uint256 private constant MIN_SUPPLY = 1e18; // 1 token (18dp)
@@ -202,6 +224,34 @@ function _validateVirtualParams(
     require(curveMaxTx >= totalSupply / MT_DIVISOR, "maxTx too small");
 }
     
+function _validateGradCapUSDRange(
+    uint256 totalSupply,
+    uint256 graduationCap,
+    uint256 ethPool
+) internal view {
+    require(graduationCap > 0 && graduationCap < totalSupply, "Invalid gradCap");
+
+    // 1. Get Chainlink ETH/USD price
+    (uint256 ethUsdPrice, uint256 updatedAt) = oracle.ethUsd();
+    require(ethUsdPrice > 0 && block.timestamp - updatedAt <= 10_800, "Oracle stale");
+
+    // 2. Pull min/max USD caps from storage
+    (, , uint256 capMinUsd, uint256 capMaxUsd, ) = storageContract.getConfig();
+
+    // 3. Estimate ETH in pool at graduation using virtual bonding curve maths
+    uint256 ethAtCap = KitchenCurveMaths.getEthForTokens(
+        totalSupply,
+        ethPool,
+        0,                // start circ (0 for genesis)
+        graduationCap
+    );
+
+    // 4. Convert ETH value → USD (8 decimals oracle)
+    uint256 usdCap = (ethAtCap * ethUsdPrice) / 1e8;
+
+    // 5. Enforce bounds
+    require(usdCap >= capMinUsd && usdCap <= capMaxUsd, "Graduation cap out of USD bounds");
+}
 
     constructor(
         address _factory,
@@ -229,88 +279,180 @@ function _validateVirtualParams(
     }
 
     // ---------- ADMIN SETTERS ----------
-    function setFactory(address _factory) external onlyOwner { factory = IKitchenFactory(_factory); }
-    function setKitchenBondingCurve(address _kitchenBondingCurve) external onlyOwner { kitchenBondingCurve = IKitchenBondingCurve(_kitchenBondingCurve); }
-    function setGraduation(address _graduation) external onlyOwner { graduation = IKitchenGraduation(_graduation); }
-    function setStorage(address _storage) external onlyOwner { storageContract = KitchenStorage(_storage); }
-    function setDeployer(address _deployer) external onlyOwner { deployer = IKitchenDeployer(_deployer); }
-    
+function setFactory(address _factory)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_FACTORY"))
+{
+    address old = address(factory);
+    factory = IKitchenFactory(_factory);
+    emit FactoryUpdated(old, _factory);
+}
 
-    // ---------- CREATOR UTILS ----------
-    function setHeaderlessPreference(address token, bool flag) external {
-        KitchenStorage.CurveProfile p = storageContract.tokenCurveProfile(token);
-        address creator;
-        if (p == KitchenStorage.CurveProfile.ADVANCED) {
-            creator = storageContract.getTokenAdvanced(token).creator;
-        } else if (p == KitchenStorage.CurveProfile.BASIC) {
-            creator = storageContract.getTokenBasic(token).creator;
-        } else if (p == KitchenStorage.CurveProfile.SUPER_SIMPLE) {
-            creator = storageContract.getTokenSuperSimple(token).creator;
-        } else {
-            creator = storageContract.getTokenZeroSimple(token).creator;
-        }
-        require(msg.sender == creator, "Only creator");
-        storageContract.setRemoveHeader(token, flag);
-    }
+function setKitchenBondingCurve(address _kitchenBondingCurve)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_BONDING_CURVE"))
+{
+    address old = address(kitchenBondingCurve);
+    kitchenBondingCurve = IKitchenBondingCurve(_kitchenBondingCurve);
+    emit BondingCurveUpdated(old, _kitchenBondingCurve);
+}
 
-    // ---------- TOKEN CREATION (Curve-based) ----------
-    function createBasicToken(
-        IKitchenFactory.BasicParamsBasic calldata b,
-        IKitchenFactory.StaticCurveParams calldata s
-    ) external payable {
-        _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
-        factory.createBasicToken{value: msg.value}(b, s, msg.sender);
-    }
+function setGraduation(address _graduation)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_GRADUATION"))
+{
+    address old = address(graduation);
+    graduation = IKitchenGraduation(_graduation);
+    emit GraduationUpdated(old, _graduation);
+}
 
-    function createBasicTokenStealth(
-        IKitchenFactory.BasicParamsBasic calldata b,
-        IKitchenFactory.StaticCurveParams calldata s
-    ) external payable {
-        _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
-        factory.createBasicTokenStealth{value: msg.value}(b, s, msg.sender);
-    }
+function setStorage(address _storage)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STORAGE"))
+{
+    address old = address(storageContract);
+    storageContract = KitchenStorage(_storage);
+    emit StorageUpdated(old, _storage);
+}
 
-    function createAdvancedToken(
-        IKitchenFactory.BasicParamsAdvanced calldata b,
-        IKitchenFactory.StaticCurveParams calldata s,
-        IKitchenFactory.AdvancedParamsInput calldata a,
-        address taxWallet
-    ) external payable {
-        _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
-        factory.createAdvancedToken{value: msg.value}(b, s, a, msg.sender, taxWallet);
-    }
+function setDeployer(address _deployer)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_DEPLOYER"))
+{
+    address old = address(deployer);
+    deployer = IKitchenDeployer(_deployer);
+    emit DeployerUpdated(old, _deployer);
+}
 
-    function createAdvancedTokenStealth(
-        IKitchenFactory.BasicParamsAdvanced calldata b,
-        IKitchenFactory.StaticCurveParams calldata s,
-        IKitchenFactory.AdvancedParamsInput calldata a,
-        address taxWallet
-    ) external payable {
-        _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
-        factory.createAdvancedTokenStealth{value: msg.value}(b, s, a, msg.sender, taxWallet);
-    }
+event OracleUpdated(address indexed oldOracle, address indexed newOracle);
 
-    function createSuperSimpleToken(
-        KitchenStorage.TokenSuperSimple calldata meta,
-        uint256 startTime,
-        bool isStealth
-    ) external payable {
-        // --- validation ---
-        require(meta.totalSupply > MIN_SUPPLY && meta.totalSupply <= MAX_SUPPLY, "Invalid supply");
-        require(meta.maxWallet >= meta.totalSupply / MW_DIVISOR,"maxWallet too small");
-        require(meta.maxTx >= meta.totalSupply / MT_DIVISOR,"maxTx too small");
-        factory.createSuperSimpleToken{value: msg.value}(meta, startTime, isStealth, msg.sender);
-    }
+function setOracle(address _oracle)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_ORACLE"))
+{
+    require(_oracle != address(0), "Invalid oracle");
+    emit OracleUpdated(address(oracle), _oracle);
+    oracle = IKitchenOracles(_oracle);
+}
 
-    function createZeroSimpleToken(
-        KitchenStorage.TokenZeroSimple calldata meta,
-        uint256 startTime,
-        bool isStealth
-    ) external payable {
-        // --- validation ---
-        require(meta.totalSupply > MIN_SUPPLY && meta.totalSupply <= MAX_SUPPLY, "Invalid supply" );
-        factory.createZeroSimpleToken{value: msg.value}(meta, startTime, isStealth, msg.sender);
-    }
+function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
+
+
+// ---------- TOKEN CREATION (Curve-based) ----------
+function createBasicToken(
+    IKitchenFactory.BasicParamsBasic calldata b,
+    IKitchenFactory.StaticCurveParams calldata s
+) external payable {
+    _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(b.totalSupply, b.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(b.graduationCap > 0 && b.graduationCap <= b.totalSupply, "Invalid graduation cap");
+
+    // --- Deploy token (old logic style, no assignment) ---
+    factory.createBasicToken{value: msg.value}(b, s, msg.sender);
+
+}
+
+
+function createBasicTokenStealth(
+    IKitchenFactory.BasicParamsBasic calldata b,
+    IKitchenFactory.StaticCurveParams calldata s
+) external payable {
+    _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(b.totalSupply, b.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(b.graduationCap > 0 && b.graduationCap <= b.totalSupply, "Invalid graduation cap");
+
+    factory.createBasicTokenStealth{value: msg.value}(b, s, msg.sender);
+}
+
+
+function createAdvancedToken(
+    IKitchenFactory.BasicParamsAdvanced calldata b,
+    IKitchenFactory.StaticCurveParams calldata s,
+    IKitchenFactory.AdvancedParamsInput calldata a,
+    address[4] calldata taxWallets,
+    uint8[4] calldata taxSplits
+) external payable {
+    _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(b.totalSupply, b.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(b.graduationCap > 0 && b.graduationCap <= b.totalSupply, "Invalid graduation cap");
+
+    factory.createAdvancedToken{value: msg.value}(b, s, a, msg.sender, taxWallets, taxSplits);
+}
+
+
+function createAdvancedTokenStealth(
+    IKitchenFactory.BasicParamsAdvanced calldata b,
+    IKitchenFactory.StaticCurveParams calldata s,
+    IKitchenFactory.AdvancedParamsInput calldata a,
+    address[4] calldata taxWallets,
+    uint8[4] calldata taxSplits
+) external payable {
+    _validateVirtualParams(b.totalSupply, s.curveMaxWallet, s.curveMaxTx);
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(b.totalSupply, b.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(b.graduationCap > 0 && b.graduationCap <= b.totalSupply, "Invalid graduation cap");
+
+
+    factory.createAdvancedTokenStealth{value: msg.value}(b, s, a, msg.sender, taxWallets, taxSplits);
+
+}
+
+
+function createSuperSimpleToken(
+    KitchenStorage.TokenSuperSimple calldata meta,
+    uint256 startTime,
+    bool isStealth
+) external payable {
+    require(meta.totalSupply > MIN_SUPPLY && meta.totalSupply <= MAX_SUPPLY, "Invalid supply");
+    require(meta.maxWallet >= meta.totalSupply / MW_DIVISOR, "maxWallet too small");
+    require(meta.maxTx >= meta.totalSupply / MT_DIVISOR, "maxTx too small");
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(meta.totalSupply, meta.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(meta.graduationCap > 0 && meta.graduationCap <= meta.totalSupply, "Invalid graduation cap");
+
+
+    factory.createSuperSimpleToken{value: msg.value}(meta, startTime, isStealth, msg.sender);
+
+}
+
+
+function createZeroSimpleToken(
+    KitchenStorage.TokenZeroSimple calldata meta,
+    uint256 startTime,
+    bool isStealth
+) external payable {
+    require(meta.totalSupply > MIN_SUPPLY && meta.totalSupply <= MAX_SUPPLY, "Invalid supply");
+    // --- Validate graduationCap is within bounds 36k - 500k USD->ETH->TOKEN---
+    _validateGradCapUSDRange(meta.totalSupply, meta.graduationCap, 0);
+    // --- Validate graduationCap in token units ---
+    require(meta.graduationCap > 0 && meta.graduationCap <= meta.totalSupply, "Invalid graduation cap");
+
+
+    factory.createZeroSimpleToken{value: msg.value}(meta, startTime, isStealth, msg.sender);
+
+}
 
     // ---------- GRADUATION / TRADING ----------
 function graduateToken(address token) external {
@@ -345,35 +487,6 @@ function sellTokenWithMinOut(address token, uint256 amount, uint256 minEthOut) e
     kitchenBondingCurve.sellTokenForWithMinOut(token, msg.sender, amount, minEthOut);
 }
 
-
-    event BalanceTransferred(address indexed token, address indexed from, address indexed to, uint256 amount);
-
-
-
-function transferCurveBalance(address token, address to, uint256 amount) external {
-    require(to != address(0), "Zero address");
-    require(!storageContract.getTokenState(token).graduated, "Token graduated");
-
-    uint256 senderBal = storageContract.getUserBalance(msg.sender, token);
-    require(senderBal >= amount && amount > 0, "Insufficient balance");
-
-    // Update balances
-    storageContract.updateUserBalance(msg.sender, token, senderBal - amount);
-
-    uint256 receiverBal = storageContract.getUserBalance(to, token);
-    if (receiverBal == 0) {
-        storageContract.addBuyer(token, to);
-    }
-    storageContract.updateUserBalance(to, token, receiverBal + amount);
-
-    // Remove sender if balance zero
-    if (senderBal - amount == 0) {
-        storageContract.removeBuyer(token, msg.sender);
-    }
-
-    emit BalanceTransferred(token, msg.sender, to, amount);
-}
-
 function getConfig() external view returns (
     address _factory,
     address _bondingCurve,
@@ -391,5 +504,40 @@ function getConfig() external view returns (
         owner
     );
 }
+
+function emergencyWithdraw(address payable to)
+    external
+    onlyOwner
+    timelocked(keccak256("EMERGENCY_WITHDRAW"))
+{
+    require(to != address(0), "Zero address");
+    uint256 amt = address(this).balance;
+    require(amt > 0, "No balance");
+    (bool ok, ) = to.call{value: amt}("");
+    require(ok, "Withdraw failed");
+    emit EmergencyWithdraw(to, amt);
+}
+
+/// @notice View helper: expected ETH in pool at graduation vs. min/max ETH bounds
+function validateGraduationEthRange(
+    uint256 totalSupply,
+    uint256 ethPool,
+    uint256 circ,
+    uint256 gradCapTokens
+) external view returns (bool withinRange, uint256 ethAtCap, uint256 minEth, uint256 maxEth) {
+    (uint256 ethUsdPrice, uint256 updatedAt) = oracle.ethUsd();
+    if (ethUsdPrice == 0 || block.timestamp - updatedAt > 10_800) return (false, 0, 0, 0);
+
+    (, , uint256 capMinUsd, uint256 capMaxUsd, ) = storageContract.getConfig();
+    minEth = (capMinUsd * 1e18) / ethUsdPrice;
+    maxEth = (capMaxUsd * 1e18) / ethUsdPrice;
+    ethAtCap = KitchenCurveMaths.getEthForTokens(totalSupply, ethPool, circ, gradCapTokens);
+    withinRange = (ethAtCap >= minEth && ethAtCap <= maxEth);
+}
+
+
+
+receive() external payable {}
+
 
 }

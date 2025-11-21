@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./KitchenTimelock.sol";
+
 /**
  * @title KitchenStorage
  * @dev Central storage contract for the Steakhouse token system.
@@ -8,7 +10,7 @@ pragma solidity ^0.8.20;
  * Now fully standardized: all numeric fields are uint256 for concordance
  * with Kitchen + Factory and ERC-20 18 decimals.
  */
-contract KitchenStorage {
+contract KitchenStorage is KitchenTimelock {
     // ========== ENUMS ==========
 
     enum TokenType { NO_TAX, TAX }
@@ -56,6 +58,10 @@ contract KitchenStorage {
         uint256 totalSupply;       
         uint256 graduationCap;     
         address taxWallet;
+        // --- NEW MULTI-TAX WALLET SUPPORT ---
+        address[4] taxWallets;   // up to 4 wallets to receive split tax
+        uint8[4]   taxSplits;    // % shares out of 100 (sum must equal 100)
+
 
         // dynamic tax decay
         uint256 curveStartingTax;   
@@ -117,6 +123,67 @@ contract KitchenStorage {
         uint256 createdAtBlock;       // block when token was created
         uint256 createdAtTimestamp;   // timestamp when token was created
         uint256 startTime;            // when trading may begin
+        uint256 limitsStart;          // when anti-whale limits begin (now tied to startTime)
+    }
+
+    // =====================================================
+    // CLAIM-MODE STATE (for >300 holders graduation)
+    // =====================================================
+
+    // virtualToken => claimMode enabled
+    mapping(address => bool) private _claimMode;
+
+    // virtualToken => (user => claimed)
+    mapping(address => mapping(address => bool)) private _hasClaimed;
+
+    // virtualToken => current index in buyers[] for chunked sweeping
+    mapping(address => uint256) private _claimCursor;
+
+// ------------------------------------------------------------
+// USD Graduation Boundaries (for creation-time validation only)
+// ------------------------------------------------------------
+// Used to validate the USD graduation target a dev supplies at creation.
+// No longer used at runtime — tokens store ETH caps individually.
+uint256 public capMinUsd;     // e.g. 36,000 * 1e8  (8-dec Chainlink style)
+uint256 public capMaxUsd;     // e.g. 500,000 * 1e8
+uint256 public overshootBps;  // default 1000 = 10 %
+
+
+    // ============== EVENTS ==============
+    event ClaimModeEnabled(address indexed virtualToken, bool enabled);
+    event Claimed(address indexed virtualToken, address indexed user, uint256 amount);
+
+    // ============== SETTERS / GETTERS ==============
+
+    /// @notice Enable or disable claim-mode for a graduated token
+    function setClaimMode(address virtualToken, bool on) external onlyAuthorized {
+        _claimMode[virtualToken] = on;
+        emit ClaimModeEnabled(virtualToken, on);
+    }
+
+    /// @notice Check if claim-mode is active for a token
+    function isClaimMode(address virtualToken) external view returns (bool) {
+        return _claimMode[virtualToken];
+    }
+
+    /// @notice Mark a user as having claimed their tokens
+    function setHasClaimed(address virtualToken, address user, bool v) external onlyAuthorized {
+        _hasClaimed[virtualToken][user] = v;
+    }
+
+    /// @notice Returns whether a user has already claimed
+    function hasClaimed(address virtualToken, address user) external view returns (bool) {
+        return _hasClaimed[virtualToken][user];
+    }
+
+    /// @notice Returns sweep cursor index for distributeRemaining
+    function getClaimCursor(address virtualToken) external view returns (uint256) {
+        return _claimCursor[virtualToken];
+    }
+
+    /// @notice Set sweep cursor index
+    function setClaimCursor(address virtualToken, uint256 i) external onlyAuthorized {
+        _claimCursor[virtualToken] = i;
     }
 
     // ========== ACCESS CONTROL ==========
@@ -144,25 +211,22 @@ contract KitchenStorage {
     }
 
 
-    uint256 public minEthAtCap;   
-    uint256 public maxEthAtCap;   
-    uint256 public overshootBps;  
 
     // ========== EVENTS ==========
-    event GraduationBoundsUpdated(uint256 minEthAtCap, uint256 maxEthAtCap, uint256 overshootBps);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event AuthorizedCallerUpdated(address indexed caller, bool status);
 
-    constructor(address _treasury) {
-        owner = msg.sender;
-        steakhouseTreasury = _treasury;
+constructor(address _treasury) {
+    owner = msg.sender;
+    steakhouseTreasury = _treasury;
 
-        minEthAtCap = 1.9 ether;
-        maxEthAtCap = 13.6 ether;
-        overshootBps = 1000; // 10%
+    // Default USD boundaries for creation-time validation
+    capMinUsd = 36_000 * 1e8;   // $36 k
+    capMaxUsd = 500_000 * 1e8;  // $500 k
+    overshootBps = 1000;        // 10 %
 
-        lastVolumeResetTimestamp = block.timestamp; // NEW
-    }
+    lastVolumeResetTimestamp = block.timestamp;
+}
 
     // ========== STORAGE LAYOUT ==========
 // Core token metadata
@@ -172,6 +236,7 @@ mapping(address => TokenAdvanced)    internal _tokensAdvanced;
 mapping(address => TokenSuperSimple) internal _tokensSuperSimple;
 mapping(address => TokenZeroSimple)  internal _tokensZeroSimple;
 mapping(address => TokenState)       internal _tokenState;
+
 
 // Token flags/config
 
@@ -187,12 +252,19 @@ mapping(address => bool)         public isZeroSimpleToken;
 mapping(address => mapping(address => uint256)) public userBalances;
 mapping(address => address[]) public buyers;
 
+// O(1) index for buyers[token] using 1-based indexing (0 == not present)
+mapping(address => mapping(address => uint256)) private buyerIndex;
+
 // Creator tracking
 
 mapping(address => address[]) public _tokensByCreator;
 mapping(address => address[]) private _stealthTokensByCreator;
 mapping(address => address)   public tokenLPs;
 mapping(address => address)   public realTokenAddress;
+
+// --- NEW MULTI-TAX STORAGE ---
+mapping(address => address[4]) public tokenTaxWallets;
+mapping(address => uint8[4])   public tokenTaxSplits;
 
 
 // Analytics
@@ -202,12 +274,19 @@ mapping(address => uint256) public volumeByToken;
 mapping(address => uint256) public tradesByToken;
 mapping(address => bool)    public isTokenGraduated;
 
+mapping(address => uint256) public postGradBuybackEth;
+mapping(address => uint256) public postGradTokensBurned;
+
 // Per-wallet analytics
 mapping(address => mapping(address => uint256)) public walletBuyVolumeByToken;
 mapping(address => mapping(address => uint256)) public walletSellVolumeByToken;
 mapping(address => uint256) public walletBuyVolume;
 mapping(address => uint256) public walletSellVolume;
 
+// --- CREATOR EXEMPTION WINDOW ---
+// Records a 6-second post-launch exemption from maxTx and maxWallet rules for creator
+mapping(address => address) public tokenCreator;
+mapping(address => uint256) public creatorBuyExemptUntil;
 
 // System Stats
 
@@ -239,6 +318,7 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
     // Lightweight accessors used by other modules to read token metadata/state.
     function getTokenBasic(address token) external view returns (TokenBasic memory) { return _tokensBasic[token]; }
     function getTokenAdvanced(address token) external view returns (TokenAdvanced memory) { return _tokensAdvanced[token]; }
+    function getTokenTaxInfo(address token) external view returns (address[4] memory wallets, uint8[4] memory splits){ return (tokenTaxWallets[token], tokenTaxSplits[token]);}
     function getTokenSuperSimple(address token) external view returns (TokenSuperSimple memory) { return _tokensSuperSimple[token]; }
     function getTokenZeroSimple(address token) external view returns (TokenZeroSimple memory) { return _tokensZeroSimple[token]; }
     function getTokenState(address token) external view returns (TokenState memory) { return _tokenState[token]; }
@@ -266,6 +346,9 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         tokenCurveProfile[token] = CurveProfile.BASIC;
         deployedTokens.push(token);
         _tokensByCreator[data.creator].push(token);
+        // Record creator exemption data (6s window from creation)
+        tokenCreator[token] = data.creator;
+        creatorBuyExemptUntil[token] = block.timestamp + 6;
         _bumpDailyCreateCounters();
     }
     function setTokenAdvanced(address token, TokenAdvanced memory data) external onlyAuthorized {
@@ -274,7 +357,16 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         tokenCurveProfile[token] = CurveProfile.ADVANCED;
         deployedTokens.push(token);
         _tokensByCreator[data.creator].push(token);
+        // Record creator exemption data (6s window from creation)
+        tokenCreator[token] = data.creator;
+        creatorBuyExemptUntil[token] = block.timestamp + 6;
         _bumpDailyCreateCounters();
+        // Save multi-tax wallet config if provided
+        if (data.taxWallets[0] != address(0)) {
+            tokenTaxWallets[token] = data.taxWallets;
+            tokenTaxSplits[token]  = data.taxSplits;
+        }
+
     }
     function setTokenSuperSimple(address token, TokenSuperSimple memory data) external onlyAuthorized {
         _tokensSuperSimple[token] = data;
@@ -282,6 +374,9 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         tokenCurveProfile[token] = CurveProfile.SUPER_SIMPLE;
         deployedTokens.push(token);
         _tokensByCreator[data.creator].push(token);
+        // Record creator exemption data (6s window from creation)
+        tokenCreator[token] = data.creator;
+        creatorBuyExemptUntil[token] = block.timestamp + 6;
         _bumpDailyCreateCounters();
     }
     function setTokenZeroSimple(address token, TokenZeroSimple memory data) external onlyAuthorized {
@@ -300,6 +395,9 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         tokenCurveProfile[token] = CurveProfile.BASIC;
         isStealthToken[token] = true;
         _stealthTokensByCreator[data.creator].push(token);
+        // Record creator exemption data (6s window from creation)
+        tokenCreator[token] = data.creator;
+        creatorBuyExemptUntil[token] = block.timestamp + 6;
     }
     function setTokenAdvancedStealth(address token, TokenAdvanced memory data) external onlyAuthorized {
         _tokensAdvanced[token] = data;
@@ -307,6 +405,15 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         tokenCurveProfile[token] = CurveProfile.ADVANCED;
         isStealthToken[token] = true;
         _stealthTokensByCreator[data.creator].push(token);
+        // Record creator exemption data (6s window from creation)
+        tokenCreator[token] = data.creator;
+        creatorBuyExemptUntil[token] = block.timestamp + 6;
+        // Save multi-tax wallet config if provided
+        if (data.taxWallets[0] != address(0)) {
+            tokenTaxWallets[token] = data.taxWallets;
+            tokenTaxSplits[token]  = data.taxSplits;
+        }
+
     }
     function setTokenSuperSimpleStealth(address token, TokenSuperSimple memory data) external onlyAuthorized {
         _tokensSuperSimple[token] = data;
@@ -323,8 +430,21 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
         _stealthTokensByCreator[data.creator].push(token);
     }
 
+function setTokenTaxInfo(address token, address[4] calldata wallets, uint8[4] calldata splits)
+    external
+    onlyAuthorized
+{
+    tokenTaxWallets[token] = wallets;
+    tokenTaxSplits[token]  = splits;
+}
+
+
     // ========== STATE ==========
-    function setTokenState(address token, TokenState memory data) external onlyAuthorized { _tokenState[token] = data; }
+    function setTokenState(address token, TokenState memory data) external onlyAuthorized {
+        if (data.limitsStart == 0) data.limitsStart = data.startTime;
+        _tokenState[token] = data;
+    }
+
     function updateTokenState(address token, uint256 ethPool, uint256 circulatingSupply) external onlyAuthorized {
         _tokenState[token].ethPool = ethPool; _tokenState[token].circulatingSupply = circulatingSupply;
     }
@@ -333,19 +453,55 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
     function markTokenGraduated(address token) external onlyAuthorized {
         if (!isTokenGraduated[token]) { isTokenGraduated[token] = true; totalGraduatedTokens++; }
     }
-    function clearBuyers(address token) external onlyAuthorized { delete buyers[token]; }
+
+
+function getCreatorExemptInfo(address token) external view returns (address creator, uint256 until) {
+    return (tokenCreator[token], creatorBuyExemptUntil[token]);
+}
+    
+function clearBuyers(address token) external onlyAuthorized {
+    // clean buyerIndex for each current buyer, then clear the array
+    address[] storage arr = buyers[token];
+    uint256 len = arr.length;
+    for (uint256 i = 0; i < len; i++) {
+        delete buyerIndex[token][arr[i]];
+    }
+    delete buyers[token];
+}
+
 
     // ========== USER ==========
     // Buyer and balance management used by the bonding curve. `addBuyer` only
     // pushes the address if the user's pre-existing balance was zero.
     function updateUserBalance(address user, address token, uint256 amount) external onlyAuthorized { userBalances[user][token] = amount; }
-    function addBuyer(address token, address user) external onlyAuthorized { if (userBalances[user][token] == 0) buyers[token].push(user); }
-    function removeBuyer(address token, address user) external onlyAuthorized {
-        if (userBalances[user][token] == 0) {
-            address[] storage arr = buyers[token]; uint256 len = arr.length;
-            for (uint256 i = 0; i < len; ++i) { if (arr[i] == user) { arr[i] = arr[len - 1]; arr.pop(); break; } }
-        }
+
+function addBuyer(address token, address user) external onlyAuthorized {
+    // Only add when the user previously had zero balance and is not already indexed
+    if (userBalances[user][token] == 0 && buyerIndex[token][user] == 0) {
+        buyers[token].push(user);
+        buyerIndex[token][user] = buyers[token].length; // store index+1
     }
+}
+
+function removeBuyer(address token, address user) external onlyAuthorized {
+    if (userBalances[user][token] == 0) {
+        uint256 idxPlus1 = buyerIndex[token][user];
+        if (idxPlus1 == 0) return; // not present / already removed
+
+        uint256 index = idxPlus1 - 1;
+        address[] storage arr = buyers[token];
+        uint256 lastIndex = arr.length - 1;
+
+        if (index != lastIndex) {
+            address last = arr[lastIndex];
+            arr[index] = last;
+            buyerIndex[token][last] = index + 1; // fix moved element index
+        }
+
+        arr.pop();
+        delete buyerIndex[token][user];
+    }
+}
 
     /// Get all token balances for a user across deployed tokens
     function getUserBalances(address user) external view returns (
@@ -373,6 +529,22 @@ event AntiPvpCooldownUpdated(uint256 newCooldown);
 
     // Tracks all dev/tax ETH distributed (live per-trade payments)
     function incrementDevEarnings(address token, uint256 amount) external onlyAuthorized { devEarnings[token] += amount; }
+
+/// @notice Record ETH spent and tokens burned during post-graduation auto buyback.
+/// @dev Only callable by authorized modules (e.g., KitchenGraduation).
+function recordPostGradBuyback(
+    address token,
+    uint256 ethSpent,
+    uint256 tokensBurned
+) external onlyAuthorized {
+    if (ethSpent > 0) {
+        postGradBuybackEth[token] += ethSpent;
+    }
+    if (tokensBurned > 0) {
+        postGradTokensBurned[token] += tokensBurned;
+    }
+}
+
 
     function incrementTokenVolume(address token, uint256 amount) external onlyAuthorized {
         // Reset if > 24h has passed since last reset
@@ -451,22 +623,60 @@ function getTotalVolume24h() external view returns (uint256) {
 
 
     // ========== AUTH ==========
-    function authorizeCaller(address caller, bool status) external onlyAuthorized {
+    function authorizeCaller(address caller, bool status) external onlyAuthorized timelocked(keccak256("UPDATE_AUTH")) {
         authorizedCallers[caller] = status; emit AuthorizedCallerUpdated(caller, status);
     }
-    function authorizeModule(address module) external onlyAuthorized {
+    function authorizeModule(address module) external onlyAuthorized timelocked(keccak256("UPDATE_MODULE")) {
         authorizedCallers[module] = true; emit AuthorizedCallerUpdated(module, true);
     }
-    function updateTreasury(address newTreasury) external onlyAuthorized {
+// ------------------------------------------------------------
+// Admin: Update USD Graduation Bounds
+// ------------------------------------------------------------
+event GraduationBoundsUpdated(uint256 minUsd, uint256 maxUsd, uint256 overshootBps);
+
+function setGraduationBoundsUSD(
+    uint256 _capMinUsd,
+    uint256 _capMaxUsd,
+    uint256 _overshootBps
+) external onlyAuthorized timelocked(keccak256("UPDATE_GRAD_BOUNDS_USD")) {
+    require(_capMinUsd > 0, "min=0");
+    require(_capMaxUsd > _capMinUsd, "max<=min");
+    require(_overshootBps <= 5000, "overshoot>50%");
+    capMinUsd = _capMinUsd;
+    capMaxUsd = _capMaxUsd;
+    overshootBps = _overshootBps;
+    emit GraduationBoundsUpdated(_capMinUsd, _capMaxUsd, _overshootBps);
+}
+
+    function updateTreasury(address newTreasury) external onlyAuthorized timelocked(keccak256("updateTreasury")) {
         require(newTreasury != address(0), "Invalid treasury");
         emit TreasuryUpdated(steakhouseTreasury, newTreasury); steakhouseTreasury = newTreasury;
     }
-    function setGraduationBounds(uint256 _minEthAtCap,uint256 _maxEthAtCap,uint256 _overshootBps) external onlyAuthorized {
-        require(_minEthAtCap > 0, "min=0"); require(_maxEthAtCap > _minEthAtCap, "max<=min");
-        require(_overshootBps <= 5000, "overshoot too high");
-        minEthAtCap = _minEthAtCap; maxEthAtCap = _maxEthAtCap; overshootBps = _overshootBps;
-        emit GraduationBoundsUpdated(_minEthAtCap, _maxEthAtCap, _overshootBps);
-    }
+
+
+event VolumeResetPeriodUpdated(uint256 newPeriod);
+uint256 public volumeResetPeriod = 1 days;
+
+function updateVolumeResetPeriod(uint256 newPeriod)
+    external
+    onlyAuthorized
+    timelocked(keccak256("updateVolumeResetPeriod"))
+{
+    require(newPeriod >= 1 hours && newPeriod <= 7 days, "Invalid period");
+    volumeResetPeriod = newPeriod;
+    emit VolumeResetPeriodUpdated(newPeriod);
+}
+
+event GlobalNonceReset(uint256 oldNonce, uint256 newNonce);
+function resetGlobalNonce(uint256 newValue)
+    external
+    onlyAuthorized
+    timelocked(keccak256("resetGlobalNonce"))
+{
+    emit GlobalNonceReset(globalNonce, newValue);
+    globalNonce = newValue;
+}
+
 
 // === Treasury skim percentage (basis points) ===
 // Used by KitchenBondingCurve to send part of dev/tax fee to treasury.
@@ -475,8 +685,8 @@ uint256 public treasuryCutBps = 1000;
 
 event TreasuryCutUpdated(uint256 oldBps, uint256 newBps);
 
-function setTreasuryCutBps(uint256 newBps) external onlyAuthorized {
-    require(newBps <= 5000, "Too high"); // max 50%
+function setTreasuryCutBps(uint256 newBps) external onlyAuthorized timelocked(keccak256("UPDATE_CUT_BPS")) {
+    require(newBps <= 2500, "Too high"); // max 25%
     emit TreasuryCutUpdated(treasuryCutBps, newBps);
     treasuryCutBps = newBps;
 }
@@ -509,7 +719,7 @@ function checkLaunchAllowed(string memory name, string memory symbol) external v
     return block.timestamp >= rec.timestamp + antiPvpCooldown;
 }
 
-function setAntiPvpCooldown(uint256 newCooldown) external onlyAuthorized {
+function setAntiPvpCooldown(uint256 newCooldown) external onlyAuthorized timelocked(keccak256("UPDATE_PVP_COOLDOWN")) {
     require(newCooldown >= 1 days && newCooldown <= 7 days, "Invalid cooldown");
     antiPvpCooldown = newCooldown;
     emit AntiPvpCooldownUpdated(newCooldown);
@@ -526,18 +736,14 @@ function setAntiPvpCooldown(uint256 newCooldown) external onlyAuthorized {
 function getConfig() external view returns (
     address _treasury,
     address _owner,
-    uint256 _minEthAtCap,
-    uint256 _maxEthAtCap,
+    uint256 _capMinUsd,
+    uint256 _capMaxUsd,
     uint256 _overshootBps
 ) {
-    return (
-        steakhouseTreasury,
-        owner,
-        minEthAtCap,
-        maxEthAtCap,
-        overshootBps
-    );
+    return (steakhouseTreasury, owner, capMinUsd, capMaxUsd, overshootBps);
 }
+
+
 
 
 }

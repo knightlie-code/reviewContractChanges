@@ -3,22 +3,53 @@ pragma solidity ^0.8.20;
 
 import "./KitchenStorage.sol";
 import "./KitchenEvents.sol";
+import "./KitchenTimelock.sol";
 
 error InsufficientETHFee();
 error CurveTaxTooHigh();
 error FinalTaxTooHigh();
 error BasicTokenExists();
 error AdvancedTokenExists();
+error FinalTaxMustBeZero();
 
-contract KitchenCreatorBasicAdvanced is KitchenEvents {
+// --- Events ---
+event FactoryUpdated(address indexed oldFactory, address indexed newFactory);
+event StorageUpdated(address indexed oldStorage, address indexed newStorage);
+event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+event EmergencyWithdraw(address indexed to, uint256 amount);
+
+
+
+contract KitchenCreatorBasicAdvanced is KitchenEvents, KitchenTimelock {
     KitchenStorage public storageContract;
     address public steakhouseTreasury;
     address public owner;
+
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
         _;
     }
+
+        // --- Access Control ---
+    address public factory;
+
+    modifier onlyFactory() {
+        require(msg.sender == factory, "Not factory");
+        _;
+    }
+
+function setFactory(address _factory)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_FACTORY"))
+{
+    address old = factory;
+    factory = _factory;
+    emit FactoryUpdated(old, _factory);
+}
+
+
 
     constructor(address _storage, address _treasury) {
         owner = msg.sender;
@@ -28,10 +59,39 @@ contract KitchenCreatorBasicAdvanced is KitchenEvents {
 
     // Admin: update the canonical storage pointer (used by creators and runtime checks)
     // Note: onlyOwner; changing this moves the authoritative token metadata store.
-    function setStorage(address s) external onlyOwner { storageContract = KitchenStorage(s); }
+function setStorage(address s)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_STORAGE"))
+{
+    address old = address(storageContract);
+    storageContract = KitchenStorage(s);
+    emit StorageUpdated(old, s);
+}
+
 
     // Admin: update the treasury address that receives platform skim/lock fees
-    function setTreasury(address t) external onlyOwner { steakhouseTreasury = t; }
+function setTreasury(address t)
+    external
+    onlyOwner
+    timelocked(keccak256("UPDATE_TREASURY"))
+{
+    address old = steakhouseTreasury;
+    steakhouseTreasury = t;
+    emit TreasuryUpdated(old, t);
+}
+
+function transferOwnership(address newOwner)
+    external
+    onlyOwner
+    timelocked(keccak256("TRANSFER_OWNERSHIP"))
+{
+    require(newOwner != address(0), "Zero address");
+    address old = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(old, newOwner);
+}
+
 
     // Compatibility shim used by other contracts when authorizations should be re-synced.
     // Left intentionally blank in this implementation; kept for external tooling compatibility.
@@ -63,6 +123,9 @@ contract KitchenCreatorBasicAdvanced is KitchenEvents {
         uint256 startTime;
         uint256 finalTaxRate;
         bool removeHeader;
+        // --- NEW MULTI-TAX WALLET SUPPORT ---
+        address[4] taxWallets;  // Up to 4 dev/marketing/revshare wallets
+        uint8[4]   taxSplits;   // % shares (sum = 100)
     }
 
     struct StaticCurveParams {
@@ -102,7 +165,8 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
             graduated: false,
             createdAtBlock: block.number,
             createdAtTimestamp: block.timestamp,
-            startTime: startTime
+            startTime: startTime,
+            limitsStart: startTime
         });
         storageContract.setTokenState(token, st);
     }
@@ -118,11 +182,16 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
         BasicParamsBasic calldata b,
         StaticCurveParams calldata s,
         address creator
-    ) external payable {
-    // Validate conservative bounds: starting tax should not exceed 20%.
+    ) external payable onlyFactory {
+    // bounds
     if (s.curveStartingTax > 20) revert CurveTaxTooHigh();
-    // If a TAX token is requested, final tax must be <= 5% (protocol-enforced cap)
-    if (b.tokenType == KitchenStorage.TokenType.TAX && b.finalTaxRate > 5) revert FinalTaxTooHigh();
+
+    // final tax rules:
+    // - always cap to 5% max (defense-in-depth)
+    // - if final ERC20 type is NO_TAX, finalTaxRate must be exactly 0
+    if (b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.tokenType == KitchenStorage.TokenType.NO_TAX && b.finalTaxRate != 0) revert FinalTaxMustBeZero();
+
 
         address token = _newVirtualTokenId(creator);
         _checksUnique(token);
@@ -150,24 +219,18 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
     storageContract.setTokenBasic(token, tb);
     _pushInitialState(token, b.startTime);
 
-    // Emit creation event: includes minimal metadata used by off-chain indexers.
-    string memory n = b.name;
-    string memory sy = b.symbol;
-    uint256 ts = b.totalSupply;
-    uint256 gc = b.graduationCap;
-
-    emit TokenCreated(token, creator, uint256(b.tokenType), false, n, sy, ts, gc, s.curveStartingTax, b.finalTaxRate, s.curveMaxWallet,    // maxWallet 
-    s.curveMaxTx,  gc   );
     }
 
     function createBasicTokenStealth(
         BasicParamsBasic calldata b,
         StaticCurveParams calldata s,
         address creator
-    ) external payable {
+    ) external payable onlyFactory {
     // stealth variants follow same validation but write to the stealth registry.
     if (s.curveStartingTax > 20) revert CurveTaxTooHigh();
-    if (b.tokenType == KitchenStorage.TokenType.TAX && b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.tokenType == KitchenStorage.TokenType.NO_TAX && b.finalTaxRate != 0) revert FinalTaxMustBeZero();
+
 
         address token = _newVirtualTokenId(creator);
         _checksUnique(token);
@@ -203,11 +266,15 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
-    ) external payable {
+        // --- NEW MULTI-TAX WALLET SUPPORT ---
+        address[4] calldata  taxWallets,  // Up to 4 dev/marketing/revshare wallets
+        uint8[4] calldata   taxSplits   // % shares (sum = 100)
+    ) external payable onlyFactory {
     // Advanced tokens may have time-varying tax/limits; still enforce conservative bounds here.
     if (s.curveStartingTax > 20) revert CurveTaxTooHigh();
-    if (b.tokenType == KitchenStorage.TokenType.TAX && b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.tokenType == KitchenStorage.TokenType.NO_TAX && b.finalTaxRate != 0) revert FinalTaxMustBeZero();
+
 
         address token = _newVirtualTokenId(creator);
         _checksUnique(token);
@@ -219,7 +286,9 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
             symbol: b.symbol,
             totalSupply: b.totalSupply,
             graduationCap: b.graduationCap,
-            taxWallet: taxWallet,
+            taxWallet: address(0), 
+            taxWallets: taxWallets,
+            taxSplits: taxSplits,
             curveStartingTax: s.curveStartingTax,
             taxDropStep: a.taxDropStep,
             taxDropInterval: a.taxDropInterval,
@@ -239,6 +308,7 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
     // Persist ADVANCED metadata and initialize runtime state. ADVANCED contains dynamic
     // drop-step/interval parameters used by `KitchenUtils.getCurrentTax` and limits helpers.
     storageContract.setTokenAdvanced(token, ta);
+    storageContract.setTokenTaxInfo(token, taxWallets, taxSplits);
     _pushInitialState(token, b.startTime);
 
     string memory n = b.name;
@@ -255,12 +325,15 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
         StaticCurveParams calldata s,
         AdvancedParamsInput calldata a,
         address creator,
-        address taxWallet
-    ) external payable {
+        address[4] calldata taxWallets,  // Up to 4 dev/marketing/revshare wallets
+        uint8[4] calldata  taxSplits   // % shares (sum = 100)
+    ) external payable onlyFactory {
     // stealth variant of ADVANCED: persists to stealth storage mapping so the exposed
     // token registry does not list the launch until explicit reveal.
     if (s.curveStartingTax > 20) revert CurveTaxTooHigh();
-    if (b.tokenType == KitchenStorage.TokenType.TAX && b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.finalTaxRate > 5) revert FinalTaxTooHigh();
+    if (b.tokenType == KitchenStorage.TokenType.NO_TAX && b.finalTaxRate != 0) revert FinalTaxMustBeZero();
+
 
         address token = _newVirtualTokenId(creator);
         _checksUnique(token);
@@ -272,7 +345,9 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
             symbol: b.symbol,
             totalSupply: b.totalSupply,
             graduationCap: b.graduationCap,
-            taxWallet: taxWallet,
+            taxWallet: address(0), 
+            taxWallets: taxWallets,
+            taxSplits: taxSplits,
             curveStartingTax: s.curveStartingTax,
             taxDropStep: a.taxDropStep,
             taxDropInterval: a.taxDropInterval,
@@ -292,5 +367,25 @@ function _newVirtualTokenId(address creator) internal returns (address token) {
     storageContract.setTokenAdvancedStealth(token, ta);
     _pushInitialState(token, b.startTime);
     }
-    
+
+// ==========================================================
+// Safety: Prevent stuck ETH 
+// ==========================================================
+receive() external payable {}
+
+function withdraw(address payable to)
+    external
+    onlyOwner
+    timelocked(keccak256("EMERGENCY_WITHDRAW"))
+{
+    require(to != address(0), "Zero address");
+    uint256 amt = address(this).balance;
+    require(amt > 0, "No balance");
+    (bool ok, ) = to.call{value: amt}("");
+    require(ok, "Withdraw failed");
+    emit EmergencyWithdraw(to, amt);
+}
+
+
+
 }
